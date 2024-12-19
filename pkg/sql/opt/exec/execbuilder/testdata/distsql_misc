@@ -73,7 +73,7 @@ SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE d
 ORDER BY 1
 ----
 start_key           end_key       replicas  lease_holder
-<before:/Table/71>  …/1/1         {1}       1
+<before:/Table/72>  …/1/1         {1}       1
 …/1/1               …/1/2         {2}       2
 …/1/2               …/1/3         {3}       3
 …/1/3               …/1/4         {4}       4
@@ -227,7 +227,7 @@ CREATE TYPE gh AS (g INT, h INT)
 
 # Try a virtual computed column whose expression cannot be distributed.
 statement ok
-ALTER TABLE data ADD COLUMN g gh[] AS (array_cat(ARRAY[(1, 2)], ARRAY[(a, b)])) VIRTUAL
+ALTER TABLE data ADD COLUMN g gh[] AS (array_cat(ARRAY[(1, 2)], ARRAY[(a, b)])::gh[]) VIRTUAL
 
 # Error if we specify the problematic virtual computed column directly.
 statement error cannot be executed with distsql

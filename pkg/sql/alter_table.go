@@ -839,6 +839,10 @@ func (n *alterTableNode) startExec(params runParams) error {
 				return err
 			}
 			descriptorChanged = true
+		case *tree.AlterTableSetRLSMode:
+			return unimplemented.NewWithIssuef(
+				136700,
+				"row-level security mode alteration is not supported")
 		default:
 			return errors.AssertionFailedf("unsupported alter command: %T", cmd)
 		}
@@ -2114,7 +2118,7 @@ func handleTTLStorageParamChange(
 			if err != nil {
 				return false, err
 			}
-			if err := s.SetSchedule(after.DeletionCronOrDefault()); err != nil {
+			if err := s.SetScheduleAndNextRun(after.DeletionCronOrDefault()); err != nil {
 				return false, err
 			}
 			if err := schedules.Update(params.ctx, s); err != nil {

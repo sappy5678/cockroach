@@ -266,7 +266,7 @@ ap-southeast-2  23
 query TT
 SELECT start_key, end_key FROM [SHOW RANGE FROM TABLE regional_by_row_table FOR ROW ('ap-southeast-2', 1)]
 ----
-<before:/Table/71>  …
+<before:/Table/72>  …
 
 query TIIII
 SELECT crdb_region, pk, pk2, a, b FROM regional_by_row_table
@@ -404,7 +404,7 @@ SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM INDEX r
 ORDER BY 1
 ----
 start_key           end_key               replicas  lease_holder
-<before:/Table/71>  …/"\x80"/0            {1}       1
+<before:/Table/72>  …/"\x80"/0            {1}       1
 …/"\x80"/0          …/"\xc0"/0            {4}       4
 …/"\xc0"/0          <after:/Table/110/5>  {7}       7
 
@@ -3171,6 +3171,7 @@ vectorized: true
 │             missing stats
 │             table: user_settings_cascades@user_settings_cascades_user_id_idx
 │             spans: [/'ap-southeast-2'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882' - /'ap-southeast-2'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882'] [/'ca-central-1'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882' - /'ca-central-1'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882'] [/'us-east-1'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882' - /'us-east-1'/'5ebfedee-0dcf-41e6-a315-5fa0b51b9882']
+│             locking strength: for update
 │
 └── • constraint-check
     │
