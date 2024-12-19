@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -181,7 +182,7 @@ func (ds *ServerImpl) setupFlow(
 ) (retCtx context.Context, _ flowinfra.Flow, _ execopnode.OpChains, retErr error) {
 	var sp *tracing.Span                       // will be Finish()ed by Flow.Cleanup()
 	var monitor, diskMonitor *mon.BytesMonitor // will be closed in Flow.Cleanup()
-	var onFlowCleanupEnd func()                // will be called at the very end of Flow.Cleanup()
+	var onFlowCleanupEnd func(context.Context) // will be called at the very end of Flow.Cleanup()
 	// Make sure that we clean up all resources (which in the happy case are
 	// cleaned up in Flow.Cleanup()) if an error is encountered.
 	defer func() {
@@ -193,7 +194,7 @@ func (ds *ServerImpl) setupFlow(
 				diskMonitor.Stop(ctx)
 			}
 			if onFlowCleanupEnd != nil {
-				onFlowCleanupEnd()
+				onFlowCleanupEnd(ctx)
 			} else {
 				reserved.Close(ctx)
 			}
@@ -244,7 +245,7 @@ func (ds *ServerImpl) setupFlow(
 	monitor.Start(ctx, parentMonitor, reserved)
 	diskMonitor = execinfra.NewMonitor(ctx, ds.ParentDiskMonitor, "flow-disk-monitor")
 
-	makeLeaf := func() (*kv.Txn, error) {
+	makeLeaf := func(ctx context.Context) (*kv.Txn, error) {
 		tis := req.LeafTxnInputState
 		if tis == nil {
 			// This must be a flow running for some bulk-io operation that doesn't use
@@ -268,27 +269,34 @@ func (ds *ServerImpl) setupFlow(
 		// this allows us to avoid an unnecessary deserialization of the eval
 		// context proto.
 		evalCtx = localState.EvalContext
+		// We create an eval context variable scoped to this block and reference
+		// it in the onFlowCleanupEnd closure. If the closure referenced
+		// evalCtx, then the pointer would be heap allocated because it is
+		// modified in the other branch of the conditional, and Go's escape
+		// analysis cannot determine that the capture and modification are
+		// mutually exclusive.
+		localEvalCtx := evalCtx
 		// We're about to mutate the evalCtx and we want to restore its original
 		// state once the flow cleans up. Note that we could have made a copy of
 		// the whole evalContext, but that isn't free, so we choose to restore
 		// the original state in order to avoid performance regressions.
-		origTxn := evalCtx.Txn
-		onFlowCleanupEnd = func() {
-			evalCtx.Txn = origTxn
+		origTxn := localEvalCtx.Txn
+		onFlowCleanupEnd = func(ctx context.Context) {
+			localEvalCtx.Txn = origTxn
 			reserved.Close(ctx)
 		}
 		if localState.MustUseLeafTxn() {
 			var err error
-			leafTxn, err = makeLeaf()
+			leafTxn, err = makeLeaf(ctx)
 			if err != nil {
 				return nil, nil, nil, err
 			}
 			// Update the Txn field early (before f.SetTxn() below) since some
 			// processors capture the field in their constructor (see #41992).
-			evalCtx.Txn = leafTxn
+			localEvalCtx.Txn = leafTxn
 		}
 	} else {
-		onFlowCleanupEnd = func() {
+		onFlowCleanupEnd = func(ctx context.Context) {
 			reserved.Close(ctx)
 		}
 		if localState.IsLocal {
@@ -304,7 +312,7 @@ func (ds *ServerImpl) setupFlow(
 		// It's important to populate evalCtx.Txn early. We'll write it again in the
 		// f.SetTxn() call below, but by then it will already have been captured by
 		// processors.
-		leafTxn, err = makeLeaf()
+		leafTxn, err = makeLeaf(ctx)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -366,20 +374,23 @@ func (ds *ServerImpl) setupFlow(
 	}
 
 	if !f.IsLocal() {
-		flowCtx.AmbientContext.AddLogTag("f", flowCtx.ID.Short().String())
+		bld := logtags.BuildBuffer()
+		bld.Add("f", flowCtx.ID.Short().String())
 		if req.JobTag != "" {
-			flowCtx.AmbientContext.AddLogTag("job", req.JobTag)
+			bld.Add("job", req.JobTag)
 		}
 		if req.StatementSQL != "" {
-			flowCtx.AmbientContext.AddLogTag("distsql.stmt", req.StatementSQL)
+			bld.Add("distsql.stmt", req.StatementSQL)
 		}
-		flowCtx.AmbientContext.AddLogTag("distsql.gateway", req.Flow.Gateway)
+		bld.Add("distsql.gateway", req.Flow.Gateway)
 		if req.EvalContext.SessionData.ApplicationName != "" {
-			flowCtx.AmbientContext.AddLogTag("distsql.appname", req.EvalContext.SessionData.ApplicationName)
+			bld.Add("distsql.appname", req.EvalContext.SessionData.ApplicationName)
 		}
 		if leafTxn != nil {
-			flowCtx.AmbientContext.AddLogTag("distsql.txn", leafTxn.ID())
+			// TODO(radu): boxing the UUID requires an allocation.
+			bld.Add("distsql.txn", leafTxn.ID())
 		}
+		flowCtx.AmbientContext.AddLogTags(bld.Finish())
 		ctx = flowCtx.AmbientContext.AnnotateCtx(ctx)
 		telemetry.Inc(sqltelemetry.DistSQLExecCounter)
 	}
@@ -405,7 +416,7 @@ func (ds *ServerImpl) setupFlow(
 	} else {
 		// If I haven't created the leaf already, do it now.
 		if leafTxn == nil {
-			leafTxn, err = makeLeaf()
+			leafTxn, err = makeLeaf(ctx)
 			if err != nil {
 				return nil, nil, nil, err
 			}
@@ -431,7 +442,7 @@ func (ds *ServerImpl) newFlowContext(
 	id execinfrapb.FlowID,
 	evalCtx *eval.Context,
 	monitor, diskMonitor *mon.BytesMonitor,
-	makeLeafTxn func() (*kv.Txn, error),
+	makeLeafTxn func(context.Context) (*kv.Txn, error),
 	traceKV bool,
 	collectStats bool,
 	localState LocalState,
@@ -483,7 +494,7 @@ func newFlow(
 	localProcessors []execinfra.LocalProcessor,
 	localVectorSources map[int32]any,
 	isVectorized bool,
-	onFlowCleanupEnd func(),
+	onFlowCleanupEnd func(context.Context),
 	statementSQL string,
 ) flowinfra.Flow {
 	base := flowinfra.NewFlowBase(flowCtx, sp, flowReg, rowSyncFlowConsumer, batchSyncFlowConsumer, localProcessors, localVectorSources, onFlowCleanupEnd, statementSQL)

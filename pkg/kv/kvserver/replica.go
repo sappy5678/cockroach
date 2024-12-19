@@ -341,6 +341,11 @@ type Replica struct {
 		msgAppScratchForFlowControl map[roachpb.ReplicaID][]raftpb.Message
 		// Scratch for populating rac2.RaftEvent.ReplicaSateInfo for flowContrlV2.
 		replicaStateScratchForFlowControl map[roachpb.ReplicaID]rac2.ReplicaStateInfo
+
+		// rangefeedCTLagObserver is used to observe the closed timestamp lag of
+		// the replica and generate a signal to potentially nudge or cancel the
+		// rangefeed based on observed lag.
+		rangefeedCTLagObserver *rangeFeedCTLagObserver
 	}
 
 	// localMsgs contains a collection of raftpb.Message that target the local
@@ -1705,6 +1710,12 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ri.ReplicaState = *(protoutil.Clone(&r.shMu.state)).(*kvserverpb.ReplicaState)
+	// TODO(#97613): add a dedicated TruncatedState field to RangeInfo when the
+	// TruncatedState field is removed from ReplicaState. We can't do it right now
+	// because the ReplicaState is embedded into RangeInfo, and this confuses the
+	// proto compiler.
+	ri.TruncatedState = (protoutil.Clone(&r.shMu.raftTruncState)).(*kvserverpb.RaftTruncatedState)
+
 	ri.LastIndex = r.shMu.lastIndexNotDurable
 	ri.NumPending = uint64(r.numPendingProposalsRLocked())
 	ri.RaftLogSize = r.shMu.raftLogSize
@@ -2328,9 +2339,6 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 
 		var mergeCommitted bool
 		switch pushTxnRes.PusheeTxn.Status {
-		case roachpb.PENDING, roachpb.STAGING:
-			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
-				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		case roachpb.COMMITTED:
 			// If PushTxn claims that the transaction committed, then the transaction
 			// definitely committed.
@@ -2385,6 +2393,9 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 					mergeCommitted = true
 				}
 			}
+		default:
+			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
+				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		}
 		r.raftMu.Lock()
 		r.readOnlyCmdMu.Lock()

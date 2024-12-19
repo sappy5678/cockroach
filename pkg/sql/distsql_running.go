@@ -1703,7 +1703,7 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 			ppInfo.resumableFlow.cleanup.isComplete = true
 		}
 		if retErr != nil && planCtx.getPortalPauseInfo() != nil {
-			planCtx.getPortalPauseInfo().resumableFlow.cleanup.run()
+			planCtx.getPortalPauseInfo().resumableFlow.cleanup.run(ctx)
 		}
 	}()
 	if len(planner.curPlan.subqueryPlans) != 0 {
@@ -1746,10 +1746,8 @@ func (dsp *DistSQLPlanner) PlanAndRunAll(
 			}
 		}
 		if !p.resumableFlow.cleanup.isComplete {
-			p.resumableFlow.cleanup.appendFunc(namedFunc{
-				fName: "cleanup flow", f: func() {
-					p.resumableFlow.flow.Cleanup(ctx)
-				},
+			p.resumableFlow.cleanup.appendFunc(func(ctx context.Context) {
+				p.resumableFlow.flow.Cleanup(ctx)
 			})
 		}
 	}
@@ -1829,7 +1827,7 @@ func (dsp *DistSQLPlanner) planAndRunSubquery(
 ) error {
 	subqueryDistribution, distSQLProhibitedErr := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
-		planner.SessionData().DistSQLMode, subqueryPlan.plan, &planner.distSQLVisitor,
+		planner.SessionData(), subqueryPlan.plan, &planner.distSQLVisitor,
 	)
 	distribute := DistributionType(LocalDistribution)
 	if subqueryDistribution.WillDistribute() {
@@ -2440,7 +2438,7 @@ func (dsp *DistSQLPlanner) planAndRunPostquery(
 ) error {
 	postqueryDistribution, distSQLProhibitedErr := getPlanDistribution(
 		ctx, planner.Descriptors().HasUncommittedTypes(),
-		planner.SessionData().DistSQLMode, postqueryPlan, &planner.distSQLVisitor,
+		planner.SessionData(), postqueryPlan, &planner.distSQLVisitor,
 	)
 	distribute := DistributionType(LocalDistribution)
 	if postqueryDistribution.WillDistribute() {

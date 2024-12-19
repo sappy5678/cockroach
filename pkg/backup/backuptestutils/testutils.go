@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
+	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
 	"github.com/cockroachdb/cockroach/pkg/testutils/sqlutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -101,6 +102,11 @@ func WithSkipInvalidDescriptorCheck() BackupTestArg {
 func StartBackupRestoreTestCluster(
 	t testing.TB, clusterSize int, args ...BackupTestArg,
 ) (*testcluster.TestCluster, *sqlutils.SQLRunner, string, func()) {
+
+	// Because the deadlock detector can increase the runtime of a test by 10-100x
+	// and has not found anything in recent memory for backup/restore tests.
+	skip.UnderDeadlock(t)
+
 	ctx := logtags.AddTag(context.Background(), "start-backup-restore-test-cluster", nil)
 	opts := backupTestOptions{}
 	for _, a := range args {
@@ -225,7 +231,7 @@ func VerifyBackupRestoreStatementResult(
 		return err
 	}
 	if a, e := columns, []string{
-		"job_id", "status", "fraction_completed", "rows", "index_entries", "bytes",
+		"job_id", "status", "fraction_completed", "rows",
 	}; !reflect.DeepEqual(e, a) {
 		return errors.Errorf("unexpected columns:\n%s", strings.Join(pretty.Diff(e, a), "\n"))
 	}
@@ -247,7 +253,7 @@ func VerifyBackupRestoreStatementResult(
 		return errors.New("zero rows in result")
 	}
 	if err := rows.Scan(
-		&actualJob.id, &actualJob.status, &actualJob.fractionCompleted, &unused, &unused, &unused,
+		&actualJob.id, &actualJob.status, &actualJob.fractionCompleted, &unused,
 	); err != nil {
 		return err
 	}
