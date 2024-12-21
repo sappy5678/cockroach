@@ -10,6 +10,7 @@ import (
 	gosql "database/sql"
 	"fmt"
 	"math/rand"
+	"strings"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
@@ -81,7 +82,6 @@ func registerBackupRestoreRoundTrip(r registry.Registry) {
 			Owner:             registry.OwnerDisasterRecovery,
 			Cluster:           r.MakeClusterSpec(4, spec.WorkloadNode()),
 			EncryptionSupport: registry.EncryptionMetamorphic,
-			RequiresLicense:   true,
 			NativeLibs:        registry.LibGEOS,
 			// See https://github.com/cockroachdb/cockroach/issues/105968
 			CompatibleClouds:           registry.Clouds(spec.GCE, spec.Local),
@@ -254,9 +254,19 @@ func startBackgroundWorkloads(
 	if err != nil {
 		return nil, err
 	}
+
+	handleChemaChangeError := func(err error) error {
+		// If the UNEXPECTED ERROR detail appears, the workload likely flaked.
+		// Otherwise, the workload could have failed due to other reasons like a node
+		// crash.
+		if err != nil && strings.Contains(errors.FlattenDetails(err), "UNEXPECTED ERROR") {
+			return registry.ErrorWithOwner(registry.OwnerSQLFoundations, errors.Wrapf(err, "schema change workload failed"))
+		}
+		return err
+	}
 	err = c.RunE(ctx, option.WithNodes(workloadNode), scInit.String())
 	if err != nil {
-		return nil, registry.ErrorWithOwner(registry.OwnerSQLFoundations, errors.Wrapf(err, "failed to init schema change workload"))
+		return nil, handleChemaChangeError(err)
 	}
 
 	run := func() (func(), error) {
@@ -264,7 +274,6 @@ func startBackgroundWorkloads(
 		if err != nil {
 			return nil, err
 		}
-
 		stopBank := workloadWithCancel(m, func(ctx context.Context) error {
 			return c.RunE(ctx, option.WithNodes(workloadNode), bankRun.String())
 		})
@@ -274,7 +283,7 @@ func startBackgroundWorkloads(
 		})
 		stopSC := workloadWithCancel(m, func(ctx context.Context) error {
 			if err := c.RunE(ctx, option.WithNodes(workloadNode), scRun.String()); err != nil {
-				return registry.ErrorWithOwner(registry.OwnerSQLFoundations, errors.Wrapf(err, "failed to run schema change workload"))
+				return handleChemaChangeError(err)
 			}
 			return nil
 		})

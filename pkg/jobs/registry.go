@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/base"
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -414,7 +415,11 @@ func createJobsInBatchWithTxn(
 		jobs[i] = j
 	}
 
-	stmt, args, jobIDs, err := batchJobInsertStmt(ctx, r, s.ID(), jobs, modifiedMicros)
+	v, err := txn.GetSystemSchemaVersion(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stmt, args, jobIDs, err := batchJobInsertStmt(ctx, r, s.ID(), jobs, modifiedMicros, v)
 	if err != nil {
 		return nil, err
 	}
@@ -469,6 +474,7 @@ func batchJobInsertStmt(
 	sessionID sqlliveness.SessionID,
 	jobs []*Job,
 	modifiedMicros int64,
+	schemaVersion roachpb.Version,
 ) (string, []interface{}, []jobspb.JobID, error) {
 	created, err := tree.MakeDTimestamp(timeutil.FromUnixMicros(modifiedMicros), time.Microsecond)
 	if err != nil {
@@ -487,6 +493,13 @@ func batchJobInsertStmt(
 			return payload.Type().String(), nil
 		},
 	}
+
+	if schemaVersion.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
+		columns = append(columns, `owner`, `description`)
+		valueFns[`owner`] = func(job *Job) (interface{}, error) { return job.Payload().UsernameProto.Decode().Normalized(), nil }
+		valueFns[`description`] = func(job *Job) (interface{}, error) { return job.Payload().Description, nil }
+	}
+
 	appendValues := func(job *Job, vals *[]interface{}) (err error) {
 		defer func() {
 			switch r := recover(); r.(type) {
@@ -577,6 +590,15 @@ func (r *Registry) CreateJobWithTxn(
 
 		cols := []string{"id", "created", "status", "claim_session_id", "claim_instance_id", "job_type"}
 		vals := []interface{}{jobID, created, StatusRunning, s.ID().UnsafeBytes(), r.ID(), jobType.String()}
+		v, err := txn.GetSystemSchemaVersion(ctx)
+		if err != nil {
+			return err
+		}
+		if v.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
+			cols = append(cols, "owner", "description")
+			vals = append(vals, j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description)
+		}
+
 		totalNumCols := len(cols)
 		numCols := totalNumCols
 		placeholders := func() string {
@@ -596,6 +618,7 @@ func (r *Registry) CreateJobWithTxn(
 		override.Database = catconstants.SystemDatabaseName
 		insertStmt := fmt.Sprintf(`INSERT INTO system.jobs (%s) VALUES (%s)`,
 			strings.Join(cols[:numCols], ","), placeholders())
+
 		_, err = txn.ExecEx(
 			ctx, "job-row-insert", txn.KV(),
 			override,
@@ -707,6 +730,17 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 
 		cols := []string{"id", "created", "status", "created_by_type", "created_by_id", "job_type"}
 		placeholders := []string{"$1", "now() at time zone 'utc'", "$2", "$3", "$4", "$5"}
+		vals := []interface{}{jobID, StatusRunning, createdByType, createdByID, typ}
+		v, err := txn.GetSystemSchemaVersion(ctx)
+		if err != nil {
+			return err
+		}
+		if v.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
+			cols = append(cols, "owner", "description")
+			placeholders = append(placeholders, "$6", "$7")
+			vals = append(vals, j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description)
+		}
+
 		// Insert the job row, but do not set a `claim_session_id`. By not
 		// setting the claim, the job can be adopted by any node and will
 		// be adopted by the node which next runs the adoption loop.
@@ -717,7 +751,7 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 		_, err = txn.ExecEx(ctx, "job-insert", txn.KV(), sessiondata.InternalExecutorOverride{
 			User:     username.NodeUserName(),
 			Database: catconstants.SystemDatabaseName,
-		}, stmt, jobID, StatusRunning, createdByType, createdByID, typ)
+		}, stmt, vals...)
 		if err != nil {
 			return err
 		}
@@ -1177,6 +1211,14 @@ SELECT distinct (id), latestpayload.value AS payload, status
 FROM jobpage AS j
 INNER JOIN latestpayload ON j.id = latestpayload.job_id`
 
+// jobMetadataTables are all of the tables that have rows storing additional
+// attributes or data about jobs beyond the core job record in system.jobs. All
+// of these tables identity the job which own rows in them using a "job_id"
+// column, meaning that any time a job is deleted from the system, all rows in
+// each of these tables with that job's ID in their "job_id" column should be
+// deleted as well.
+var jobMetadataTables = []string{"job_info", "job_progress", "job_progress_history", "job_status", "job_message"}
+
 // cleanupOldJobsPage deletes up to cleanupPageSize job rows with ID > minID.
 // minID is supposed to be the maximum ID returned by the previous page (0 if no
 // previous page).
@@ -1225,22 +1267,44 @@ func (r *Registry) cleanupOldJobsPage(
 	if len(toDelete.Array) > 0 {
 		log.VEventf(ctx, 2, "attempting to clean up %d expired job records", len(toDelete.Array))
 		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
-		const infoStmt = `DELETE FROM system.job_info WHERE job_id = ANY($1)`
-		var nDeleted, nDeletedInfos int
-		if nDeleted, err = r.db.Executor().Exec(
+		nDeleted, err := r.db.Executor().Exec(
 			ctx, "gc-jobs", nil /* txn */, stmt, toDelete,
-		); err != nil {
+		)
+		if err != nil {
 			log.Warningf(ctx, "error cleaning up %d jobs: %v", len(toDelete.Array), err)
 			return false, 0, errors.Wrap(err, "deleting old jobs")
 		}
-		nDeletedInfos, err = r.db.Executor().Exec(
-			ctx, "gc-job-infos", nil /* txn */, infoStmt, toDelete,
-		)
-		if err != nil {
-			return false, 0, errors.Wrap(err, "deleting old job infos")
+
+		counts := make(map[string]int)
+		for i, tbl := range jobMetadataTables {
+			var deleted int
+			if err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
+				// Tables other than job_info -- the 0th -- are only present if the txn is
+				// running at a version that includes them.
+				if i > 0 {
+					v, err := txn.GetSystemSchemaVersion(ctx)
+					if err != nil {
+						return err
+					}
+					if v.Less(clusterversion.V25_1_AddJobsTables.Version()) {
+						return nil
+					}
+				}
+				deleted, err = txn.Exec(ctx, redact.RedactableString("gc-job-"+tbl), txn.KV(),
+					"DELETE FROM system."+tbl+" WHERE job_id = ANY($1)", toDelete,
+				)
+				if err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				return false, 0, errors.Wrapf(err, "deleting old job metadata from %s", tbl)
+			}
+			counts[tbl] = deleted
 		}
 		if nDeleted > 0 {
-			log.Infof(ctx, "cleaned up %d expired job records and %d expired info records", nDeleted, nDeletedInfos)
+			log.Infof(ctx, "cleaned up %d expired job records (%d infos, %d progresses, %d progress_hists, %d statuses, %d messages)",
+				nDeleted, counts["job_info"], counts["job_progress"], counts["job_progress_history"], counts["job_status"], counts["job_message"])
 		}
 	}
 	// If we got as many rows as we asked for, there might be more.
@@ -1254,7 +1318,7 @@ func (r *Registry) cleanupOldJobsPage(
 
 // DeleteTerminalJobByID deletes the given job ID if it is in a
 // terminal state. If it is is in a non-terminal state, an error is
-// returned.
+// returned. This API should not be used.
 func (r *Registry) DeleteTerminalJobByID(ctx context.Context, id jobspb.JobID) error {
 	return r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
 		row, err := txn.QueryRow(ctx, "get-job-status", txn.KV(),
@@ -1274,10 +1338,26 @@ func (r *Registry) DeleteTerminalJobByID(ctx context.Context, id jobspb.JobID) e
 			if err != nil {
 				return err
 			}
-			_, err = txn.Exec(
-				ctx, "delete-job-info", txn.KV(), "DELETE FROM system.job_info WHERE job_id = $1", id,
-			)
-			return err
+			for i, tbl := range jobMetadataTables {
+				if i > 0 {
+					v, err := txn.GetSystemSchemaVersion(ctx)
+					if err != nil {
+						return err
+					}
+					if v.Less(clusterversion.V25_1_AddJobsTables.Version()) {
+						break
+					}
+				}
+
+				_, err = txn.Exec(
+					ctx, redact.RedactableString("delete-job-"+tbl), txn.KV(),
+					"DELETE FROM system."+tbl+" WHERE job_id = $1", id,
+				)
+				if err != nil {
+					return err
+				}
+			}
+			return nil
 		default:
 			return errors.Newf("job %d has non-terminal status: %q", id, status)
 		}

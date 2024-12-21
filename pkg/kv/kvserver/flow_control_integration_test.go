@@ -19,9 +19,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/batcheval"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowinspectpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/rac2"
@@ -38,10 +40,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/testutils/testcluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
 	"github.com/olekukonko/tablewriter"
@@ -5461,6 +5467,259 @@ func TestFlowControlSendQueueRangeRelocate(t *testing.T) {
 	})
 }
 
+// TestFlowControlRangeSplitMergeMixedVersion attempts a split and merge while
+// the elastic tokens are exhausted to one store and the flow control mode is
+// apply_to_elastic. See the longer SQL comment for a detailed view of the
+// steps taken by the test.
+func TestFlowControlRangeSplitMergeMixedVersion(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	const numNodes = 3
+	prevVKey := clusterversion.PreviousRelease
+	latestVKey := clusterversion.Latest
+	settings := cluster.MakeTestingClusterSettingsWithVersions(
+		latestVKey.Version(), prevVKey.Version(), false)
+	var disableWorkQueueGranting atomic.Bool
+	disableWorkQueueGranting.Store(true)
+	// We want to exhaust the elastic tokens, but not the regular tokens.
+	kvflowcontrol.ElasticTokensPerStream.Override(ctx, &settings.SV, 3<<20)
+
+	disableWorkQueueGrantingServers := make([]atomic.Bool, numNodes)
+	setTokenReturnEnabled := func(enabled bool, serverIdxs ...int) {
+		for _, serverIdx := range serverIdxs {
+			disableWorkQueueGrantingServers[serverIdx].Store(!enabled)
+		}
+	}
+
+	argsPerServer := make(map[int]base.TestServerArgs)
+	for i := range disableWorkQueueGrantingServers {
+		disableWorkQueueGrantingServers[i].Store(true)
+		argsPerServer[i] = base.TestServerArgs{
+			Settings: settings,
+			Knobs: base.TestingKnobs{
+				Server: &server.TestingKnobs{
+					ClusterVersionOverride:         prevVKey.Version(),
+					DisableAutomaticVersionUpgrade: make(chan struct{}),
+				},
+				Store: &kvserver.StoreTestingKnobs{
+					FlowControlTestingKnobs: &kvflowcontrol.TestingKnobs{
+						UseOnlyForScratchRanges: true,
+						OverrideTokenDeduction: func(tokens kvflowcontrol.Tokens) kvflowcontrol.Tokens {
+							return kvflowcontrol.Tokens(1 << 20)
+						},
+						OverrideAlwaysRefreshSendStreamStats: true,
+					},
+				},
+				AdmissionControl: &admission.TestingKnobs{
+					DisableWorkQueueFastPath: true,
+					DisableWorkQueueGranting: func() bool {
+						idx := i
+						return disableWorkQueueGrantingServers[idx].Load()
+					},
+				},
+			},
+		}
+	}
+
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationManual,
+		ServerArgsPerNode: argsPerServer,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+	tc.AddVotersOrFatal(t, k, tc.Targets(1, 2)...)
+
+	h := newFlowControlTestHelper(
+		t, tc, "flow_control_integration_v2", /* testdata */
+		kvflowcontrol.V2EnabledWhenLeaderV2Encoding, true, /* isStatic */
+	)
+
+	const mode = kvflowcontrol.ApplyToElastic
+	h.init(mode)
+	defer h.close("range_split_merge_mixed_version")
+
+	desc, err := tc.LookupRange(k)
+	require.NoError(t, err)
+	h.enableVerboseRaftMsgLoggingForRange(desc.RangeID)
+	h.enableVerboseRaftMsgLoggingForRange(desc.RangeID + 1)
+	n1 := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	h.waitForConnectedStreams(ctx, desc.RangeID, 3, 0 /* serverIdx */)
+	h.resetV2TokenMetrics(ctx)
+
+	h.log(fmt.Sprintf("cluster_version=%v(%+v) latest_version=%v(%+v)",
+		prevVKey.Version(), prevVKey, latestVKey.Version(), latestVKey))
+	setTokenReturnEnabled(true /* enabled */, 0, 1)
+	h.comment(`
+-- This test is running with kvadmission.flow_control.mode="apply_to_elastic"
+-- and the cluster version set to the previous version. We will exhaust the
+-- elastic tokens towards s3. Then, we will split and merge the range,
+-- expecting no send queue to form for any stream, as apply_to_elastic is the
+-- flow control mode. We also expect that the split and merge will proceed
+-- without issue. Note that admission is currently blocked on n3(s3).
+`)
+
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.BulkNormalPri)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.BulkNormalPri)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.BulkNormalPri)
+	h.comment(`(Sent 3x1 MiB BulkNormalPri put request to pre-split range)`)
+
+	var cancels []func()
+	var recordingFns []func() tracingpb.Recording
+	var recordings []tracingpb.Recording
+	cancelAll := func() {
+		require.Equal(t, len(cancels), len(recordingFns))
+		recordings = make([]tracingpb.Recording, len(cancels))
+		for i := range cancels {
+			cancels[i]()
+			// We also need to finish the tracing spans.
+			recordings = append(recordings, recordingFns[i]())
+		}
+	}
+
+	// For each async put, we will record the tracing span and retain the ability
+	// to cancel it. This involves some more tracking to ensure we complete
+	// tracing spans and avoid leaving dangling goroutines (the stopper will get
+	// them eventually however).
+	preIdx := len(cancels)
+	traceCtxPre, recPre := tracing.ContextWithRecordingSpan(ctx,
+		tc.GetFirstStoreFromServer(t, 0 /* server */).GetStoreConfig().Tracer(), "pre-split")
+	recordingFns = append(recordingFns, recPre)
+	cancelPre, chPre := h.putAsync(traceCtxPre, roachpb.Key(desc.StartKey), 1, admissionpb.BulkNormalPri)
+	cancels = append(cancels, cancelPre)
+	h.comment(`(Sent 1 MiB BulkNormalPri put request to pre-split range)`)
+
+	h.comment(`-- (Splitting range.)`)
+	left, right := tc.SplitRangeOrFatal(t, k.Next())
+	h.waitForConnectedStreams(ctx, left.RangeID, 3, 0 /* serverIdx */)
+	h.waitForConnectedStreams(ctx, right.RangeID, 3, 0 /* serverIdx */)
+
+	h.comment(`-- Observe the newly split off replica, with its own three streams.`)
+	h.query(n1, `
+  SELECT range_id, count(*) AS streams
+    FROM crdb_internal.kv_flow_control_handles_v2
+GROUP BY (range_id)
+ORDER BY streams DESC;
+`, "range_id", "stream_count")
+
+	// LHS post-split put.
+	leftIdx := len(cancels)
+	traceCtxLeft, recLeft := tracing.ContextWithRecordingSpan(ctx,
+		tc.GetFirstStoreFromServer(t, 0 /* server */).GetStoreConfig().Tracer(), "lhs")
+	recordingFns = append(recordingFns, recLeft)
+	cancelLeft, chLeft := h.putAsync(traceCtxLeft, roachpb.Key(left.StartKey), 1, admissionpb.BulkNormalPri)
+	cancels = append(cancels, cancelLeft)
+	h.comment(`(Sent 1 MiB BulkNormalPri put request to post-split LHS range)`)
+
+	// RHS post-split put.
+	rightIdx := len(cancels)
+	traceCtxRight, recRight := tracing.ContextWithRecordingSpan(ctx,
+		tc.GetFirstStoreFromServer(t, 0 /* server */).GetStoreConfig().Tracer(), "rhs")
+	recordingFns = append(recordingFns, recRight)
+	cancelRight, chRight := h.putAsync(traceCtxRight, roachpb.Key(right.StartKey), 1, admissionpb.BulkNormalPri)
+	cancels = append(cancels, cancelRight)
+	h.comment(`(Sent 1 MiB BulkNormalPri put request to post-split RHS range)`)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split and 1 MiB put on
+-- each side.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`-- (Merging ranges.)`)
+	merged := tc.MergeRangesOrFatal(t, left.StartKey.AsRawKey())
+	h.waitForConnectedStreams(ctx, merged.RangeID, 3, 0 /* serverIdx */)
+	h.waitForSendQueueSize(ctx, merged.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split-merge.
+-- We expect to not see a force flush of the send queue for s3 again.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	// Post-split-merge put.
+	mergeIdx := len(cancels)
+	traceCtxMerge, recMerge := tracing.ContextWithRecordingSpan(ctx,
+		tc.GetFirstStoreFromServer(t, 0 /* server */).GetStoreConfig().Tracer(), "merge")
+	recordingFns = append(recordingFns, recMerge)
+	cancelMerge, chMerge := h.putAsync(traceCtxMerge, roachpb.Key(merged.StartKey), 1, admissionpb.BulkNormalPri)
+	cancels = append(cancels, cancelMerge)
+	h.comment(`(Sent 1 MiB BulkNormalPri put request to post-split-merge range)`)
+	h.waitForSendQueueSize(ctx, merged.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split-merge. 
+-- We do not expect to see the send queue develop for s3.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`
+-- Allow admission to proceed on all nodes and wait for all tokens to be
+-- returned.`)
+	setTokenReturnEnabled(true /* enabled */, 0, 1, 2)
+	// We expect that there are no tracked tokens initially, as there are no
+	// tokens available towards s3. Therefore, we wait for the total tracked
+	// tokens to be greater than zero before proceeding to check that all tokens
+	// are returned. This prevents an edge case where the test will fail because
+	// not all tokens are actually returned, due to not having yet sent the
+	// elastic pri entries to followers, passing the all token returned check
+	// here but not later in the testdata file.
+	h.waitForTotalTrackedTokensGE(ctx, merged.RangeID, 1<<20 /* 1MiB expTotalTrackedTokensGE */, 0 /* serverIdx */)
+	h.waitForTotalTrackedTokensForDuration(ctx, merged.RangeID, 0 /* expTotalTrackedTokens */, 0 /* serverIdx */, 2*time.Second)
+	h.waitForAllTokensReturned(ctx, 3 /* expStreamCount */, 0 /* serverIdx */)
+
+	select {
+	// The pre-split put should have returned after enabling admission.
+	case res := <-chPre:
+		h.comment(fmt.Sprintf("pre-split response br=%v pErr=%v", res.BatchResponse, res.Error))
+	case <-time.After(2 * time.Second):
+		cancelAll()
+		t.Fatalf("expected pre-split put to return after enabling admission, trace: %s", recordings[preIdx])
+	}
+	select {
+	// Likewise for the post-split LHS put.
+	case res := <-chLeft:
+		h.comment(fmt.Sprintf("post-split LHS response br=%v pErr=%v", res.BatchResponse, res.Error))
+	case <-time.After(2 * time.Second):
+		cancelAll()
+		t.Fatalf("expected LHS put to return after enabling admission, trace: %s", recordings[leftIdx])
+	}
+	select {
+	// And for the post-split RHS put. Note that the RHS put will return to the
+	// dist sender after the RHS range controller is closed (merge). After this,
+	// the dist sender will exhaust the other replicas which have also been
+	// removed from the range (n2,n3), before refreshing the range cache and
+	// redirecting the request to the merged range which succeeds.
+	case res := <-chRight:
+		h.comment(fmt.Sprintf("post-split RHS response br=%v pErr=%v", res.BatchResponse, res.Error))
+	case <-time.After(2 * time.Second):
+		cancelAll()
+		t.Fatalf("expected RHS put to return after enabling admission, trace: %s", recordings[rightIdx])
+	}
+	select {
+	// And for the post-split-merge put.
+	case res := <-chMerge:
+		h.comment(fmt.Sprintf("post-merge response br=%v pErr=%v", res.BatchResponse, res.Error))
+	case <-time.After(2 * time.Second):
+		cancelAll()
+		t.Fatalf("expected merge put to return after enabling admission, trace: %s", recordings[mergeIdx])
+	}
+
+	h.comment(`-- Flow token metrics from n1, all tokens should be returned.`)
+	h.query(n1, v2FlowTokensQueryStr)
+
+	// Ensure all the tracing spans are closed. They will be closed if we hit a
+	// non result (test failure) case above.
+	recPre()
+	recLeft()
+	recRight()
+	recMerge()
+}
+
 func TestFlowControlSendQueueRangeMigrate(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
@@ -5676,6 +5935,474 @@ func TestFlowControlSendQueueRangeMigrate(t *testing.T) {
 	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
 }
 
+// TestFlowControlSendQueueRangeSplitMerge exercises the send queue formation,
+// prevention and force flushing due to range split and merge operations. See
+// the initial comment for an overview of the test structure.
+func TestFlowControlSendQueueRangeSplitMerge(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	const numNodes = 3
+	settings := cluster.MakeTestingClusterSettings()
+	kvflowcontrol.Mode.Override(ctx, &settings.SV, kvflowcontrol.ApplyToAll)
+	// We want to exhaust tokens but not overload the test, so we set the limits
+	// lower (8 and 16 MiB default).
+	kvflowcontrol.ElasticTokensPerStream.Override(ctx, &settings.SV, 2<<20)
+	kvflowcontrol.RegularTokensPerStream.Override(ctx, &settings.SV, 4<<20)
+	// TODO(kvoli): There are unexpected messages popping up, which cause a send
+	// queue to be created on the RHS range post-split. This appears related to
+	// leader leases, or at least disablng them deflakes the test. We should
+	// re-enable leader leases likely by adjusting the test to ignore the 500b
+	// send queue formatiion:
+	//
+	//  r3=(is_state_replicate=true has_send_queue=true send_queue_size=500 B / 1 entries
+	//      [idx_to_send=12 next_raft_idx=13 next_raft_idx_initial=13 force_flush_stop_idx=0])
+	//
+	// See #136258 for more debug info.
+	kvserver.OverrideDefaultLeaseType(ctx, &settings.SV, roachpb.LeaseEpoch)
+	disableWorkQueueGrantingServers := make([]atomic.Bool, numNodes)
+	setTokenReturnEnabled := func(enabled bool, serverIdxs ...int) {
+		for _, serverIdx := range serverIdxs {
+			disableWorkQueueGrantingServers[serverIdx].Store(!enabled)
+		}
+	}
+
+	argsPerServer := make(map[int]base.TestServerArgs)
+	for i := range disableWorkQueueGrantingServers {
+		disableWorkQueueGrantingServers[i].Store(true)
+		argsPerServer[i] = base.TestServerArgs{
+			Settings: settings,
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					FlowControlTestingKnobs: &kvflowcontrol.TestingKnobs{
+						UseOnlyForScratchRanges: true,
+						OverrideTokenDeduction: func(tokens kvflowcontrol.Tokens) kvflowcontrol.Tokens {
+							// Deduct every write as 1 MiB, regardless of how large it
+							// actually is.
+							return kvflowcontrol.Tokens(1 << 20)
+						},
+						// We want to test the behavior of the send queue, so we want to
+						// always have up-to-date stats. This ensures that the send queue
+						// stats are always refreshed on each call to
+						// RangeController.HandleRaftEventRaftMuLocked.
+						OverrideAlwaysRefreshSendStreamStats: true,
+					},
+				},
+				AdmissionControl: &admission.TestingKnobs{
+					DisableWorkQueueFastPath: true,
+					DisableWorkQueueGranting: func() bool {
+						idx := i
+						return disableWorkQueueGrantingServers[idx].Load()
+					},
+				},
+			},
+		}
+	}
+
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationManual,
+		ServerArgsPerNode: argsPerServer,
+	})
+	defer tc.Stopper().Stop(ctx)
+
+	k := tc.ScratchRange(t)
+	tc.AddVotersOrFatal(t, k, tc.Targets(1, 2)...)
+
+	h := newFlowControlTestHelper(
+		t, tc, "flow_control_integration_v2", /* testdata */
+		kvflowcontrol.V2EnabledWhenLeaderV2Encoding, true, /* isStatic */
+	)
+	h.init(kvflowcontrol.ApplyToAll)
+	defer h.close("send_queue_range_split_merge")
+
+	desc, err := tc.LookupRange(k)
+	require.NoError(t, err)
+	h.enableVerboseRaftMsgLoggingForRange(desc.RangeID)
+	h.enableVerboseRaftMsgLoggingForRange(desc.RangeID + 1)
+	n1 := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	h.waitForConnectedStreams(ctx, desc.RangeID, 3, 0 /* serverIdx */)
+	// Reset the token metrics, since a send queue may have instantly
+	// formed when adding one of the replicas, before being quickly
+	// drained.
+	h.resetV2TokenMetrics(ctx)
+
+	// TODO(kvoli): Update this comment to also mention writing to the RHS range,
+	// once we resolve the subsume wait for application issue. See #136649.
+	h.comment(`
+-- We will exhaust the tokens across all streams while admission is blocked on
+-- n3, using a single 4 MiB (deduction, the write itself is small) write. Then,
+-- we will write a 1 MiB put to the range, split it, write a 1 MiB put to the
+-- LHS range, and a 1MiB put to the RHS range, merge the ranges, and write a 1
+-- MiB put to the merged range. We expect that at each stage where a send
+-- queue develops n1->s3, the send queue will be flushed by the range merge
+-- and range split range operations.`)
+	h.comment(`
+-- Start by exhausting the tokens from n1->s3 and blocking admission on s3.
+-- (Issuing 4x1MiB regular, 3x replicated write that's not admitted on s3.)`)
+	setTokenReturnEnabled(true /* enabled */, 0, 1)
+	setTokenReturnEnabled(false /* enabled */, 2)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.waitForTotalTrackedTokens(ctx, desc.RangeID, 4<<20 /* 4 MiB */, 0 /* serverIdx */)
+
+	h.comment(`(Sending 1 MiB put request to pre-split range)`)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.comment(`(Sent 1 MiB put request to pre-split range)`)
+
+	h.waitForTotalTrackedTokens(ctx, desc.RangeID, 4<<20 /* 4 MiB */, 0 /* serverIdx */)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+	h.waitForSendQueueSize(ctx, desc.RangeID, 1<<20 /* expSize 1 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue metrics from n1, n3's send queue should have 1 MiB for s3.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.comment(`
+-- Observe the total tracked tokens per-stream on n1, s3's entries will still
+-- be tracked here.`)
+	h.query(n1, `
+  SELECT range_id, store_id, crdb_internal.humanize_bytes(total_tracked_tokens::INT8)
+    FROM crdb_internal.kv_flow_control_handles_v2
+`, "range_id", "store_id", "total_tracked_tokens")
+	h.comment(`
+-- Per-store tokens available from n1, these should reflect the lack of tokens 
+-- for s3.`)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`-- (Splitting range.)`)
+	left, right := tc.SplitRangeOrFatal(t, k.Next())
+	h.waitForConnectedStreams(ctx, left.RangeID, 3, 0 /* serverIdx */)
+	h.waitForConnectedStreams(ctx, right.RangeID, 3, 0 /* serverIdx */)
+	h.waitForSendQueueSize(ctx, left.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+	h.waitForSendQueueSize(ctx, right.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+
+	h.comment(`-- Observe the newly split off replica, with its own three streams.`)
+	h.query(n1, `
+  SELECT range_id, count(*) AS streams
+    FROM crdb_internal.kv_flow_control_handles_v2
+GROUP BY (range_id)
+ORDER BY streams DESC;
+`, "range_id", "stream_count")
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split.
+-- We expect to see a force flush of the send queue for s3.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`(Sending 1 MiB put request to post-split LHS range)`)
+	h.put(ctx, roachpb.Key(left.StartKey), 1, admissionpb.NormalPri)
+	h.comment(`(Sent 1 MiB put request to post-split LHS range)`)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+
+	h.comment(`(Sending 1 MiB put request to post-split RHS range)`)
+	h.put(ctx, roachpb.Key(right.StartKey), 1, admissionpb.NormalPri)
+	h.comment(`(Sent 1 MiB put request to post-split RHS range)`)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split and 1 MiB put on
+-- each side.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`-- (Merging ranges.)`)
+	merged := tc.MergeRangesOrFatal(t, left.StartKey.AsRawKey())
+	h.waitForConnectedStreams(ctx, merged.RangeID, 3, 0 /* serverIdx */)
+	h.waitForSendQueueSize(ctx, merged.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split-merge.
+-- We expect to see a force flush of the send queue for s3 again.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`(Sending 1 MiB put request to post-split-merge range)`)
+	h.put(ctx, k, 1, admissionpb.NormalPri)
+	h.comment(`(Sent 1 MiB put request to post-split-merge range)`)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+	h.waitForSendQueueSize(ctx, merged.RangeID, 1<<20 /* expSize 1 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue and flow token metrics from n1, post-split-merge and 1 MiB put.
+-- We expect to see the send queue develop for s3 again.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	h.comment(`-- (Allowing below-raft admission to proceed on [n1,n2,n3].)`)
+	setTokenReturnEnabled(true /* enabled */, 0, 1, 2)
+
+	h.waitForAllTokensReturned(ctx, 3, 0 /* serverIdx */)
+	h.comment(`
+-- Send queue and flow token metrics from n1, all tokens should be returned.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+}
+
+func TestFlowControlSendQueueRangeFeed(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// rangeFeed will create a rangefeed suitable for testing. It will start a
+	// rangefeed and return a function that can be used to stop it.
+	rangeFeed := func(
+		ctx context.Context,
+		dsI interface{},
+		sp roachpb.Span,
+		startFrom hlc.Timestamp,
+		onValue func(event kvcoord.RangeFeedMessage),
+		opts ...kvcoord.RangeFeedOption,
+	) func() {
+		ds := dsI.(*kvcoord.DistSender)
+		events := make(chan kvcoord.RangeFeedMessage)
+		cancelCtx, cancel := context.WithCancel(ctx)
+
+		g := ctxgroup.WithContext(cancelCtx)
+		g.GoCtx(func(ctx context.Context) (err error) {
+			return ds.RangeFeed(ctx, []kvcoord.SpanTimePair{{Span: sp, StartAfter: startFrom}}, events, opts...)
+		})
+		g.GoCtx(func(ctx context.Context) error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case ev := <-events:
+					onValue(ev)
+				}
+			}
+		})
+
+		return func() {
+			cancel()
+			_ = g.Wait()
+		}
+	}
+	// We will use the below logic later to assert on the node that the rangefeed
+	// is running on.
+	var curRangeFeedNodeID atomic.Value
+	curRangeFeedNodeID.Store(roachpb.NodeID(0))
+	checkRangeFeedNodeID := func(nodeID roachpb.NodeID, include bool) error {
+		curNodeID := curRangeFeedNodeID.Load().(roachpb.NodeID)
+		if curNodeID == 0 {
+			return errors.New("no rangefeed node yet")
+		}
+		if curNodeID != nodeID && include {
+			return errors.Errorf("expected rangefeed on n%v, got n%v", nodeID, curNodeID)
+		}
+		if curNodeID == nodeID && !include {
+			return errors.Errorf("expected rangefeed not on n%v", nodeID)
+		}
+		return nil
+	}
+
+	ctx := context.Background()
+	const numNodes = 3
+	settings := cluster.MakeTestingClusterSettings()
+	kvflowcontrol.Mode.Override(ctx, &settings.SV, kvflowcontrol.ApplyToAll)
+	// We want to exhaust tokens but not overload the test, so we set the limits
+	// lower (8 and 16 MiB default).
+	kvflowcontrol.ElasticTokensPerStream.Override(ctx, &settings.SV, 2<<20)
+	kvflowcontrol.RegularTokensPerStream.Override(ctx, &settings.SV, 4<<20)
+	kvserver.RangefeedEnabled.Override(ctx, &settings.SV, true)
+	// Speed up cancellation, default is 20x the target duration.
+	kvserver.RangeFeedLaggingCTCancelMultiple.Override(ctx, &settings.SV, 6)
+	// Also speed up cancellation by shortening the required lag duration,
+	// default is 60s.
+	kvserver.RangeFeedLaggingCTCancelDuration.Override(ctx, &settings.SV, 3*time.Second)
+	// Likewise, the default target duration is 3s, lower it by a factor of 20.
+	closedts.TargetDuration.Override(ctx, &settings.SV, 150*time.Millisecond)
+
+	disableWorkQueueGrantingServers := make([]atomic.Bool, numNodes)
+	setTokenReturnEnabled := func(enabled bool, serverIdxs ...int) {
+		for _, serverIdx := range serverIdxs {
+			disableWorkQueueGrantingServers[serverIdx].Store(!enabled)
+		}
+	}
+
+	argsPerServer := make(map[int]base.TestServerArgs)
+	for i := range disableWorkQueueGrantingServers {
+		disableWorkQueueGrantingServers[i].Store(true)
+		argsPerServer[i] = base.TestServerArgs{
+			Settings: settings,
+			Knobs: base.TestingKnobs{
+				Store: &kvserver.StoreTestingKnobs{
+					FlowControlTestingKnobs: &kvflowcontrol.TestingKnobs{
+						UseOnlyForScratchRanges: true,
+						OverrideTokenDeduction: func(tokens kvflowcontrol.Tokens) kvflowcontrol.Tokens {
+							// Deduct every write as 1 MiB, regardless of how large it
+							// actually is.
+							return kvflowcontrol.Tokens(1 << 20)
+						},
+						// We want to test the behavior of the send queue, so we want to
+						// always have up-to-date stats. This ensures that the send queue
+						// stats are always refreshed on each call to
+						// RangeController.HandleRaftEventRaftMuLocked.
+						OverrideAlwaysRefreshSendStreamStats: true,
+					},
+				},
+				AdmissionControl: &admission.TestingKnobs{
+					DisableWorkQueueFastPath: true,
+					DisableWorkQueueGranting: func() bool {
+						idx := i
+						return disableWorkQueueGrantingServers[idx].Load()
+					},
+				},
+			},
+		}
+	}
+
+	tc := testcluster.StartTestCluster(t, numNodes, base.TestClusterArgs{
+		ReplicationMode:   base.ReplicationManual,
+		ServerArgsPerNode: argsPerServer,
+	})
+	defer tc.Stopper().Stop(ctx)
+	setTokenReturnEnabled(true /* enabled */, 0, 1, 2)
+
+	k := tc.ScratchRange(t)
+	tc.AddVotersOrFatal(t, k, tc.Targets(1, 2)...)
+
+	h := newFlowControlTestHelper(
+		t, tc, "flow_control_integration_v2", /* testdata */
+		kvflowcontrol.V2EnabledWhenLeaderV2Encoding, true, /* isStatic */
+	)
+	h.init(kvflowcontrol.ApplyToAll)
+	defer h.close("send_queue_range_feed")
+
+	desc, err := tc.LookupRange(k)
+	require.NoError(t, err)
+	h.enableVerboseRaftMsgLoggingForRange(desc.RangeID)
+	n1 := sqlutils.MakeSQLRunner(tc.ServerConn(0))
+	n3 := sqlutils.MakeSQLRunner(tc.ServerConn(2))
+	h.waitForConnectedStreams(ctx, desc.RangeID, 3, 0 /* serverIdx */)
+	h.resetV2TokenMetrics(ctx)
+	h.waitForConnectedStreams(ctx, desc.RangeID, 3, 0 /* serverIdx */)
+
+	ts := tc.Server(2)
+	span := desc.KeySpan().AsRawSpanWithNoLocals()
+	ignoreValues := func(event kvcoord.RangeFeedMessage) {}
+
+	ctx2, cancel := context.WithCancel(context.Background())
+	g := ctxgroup.WithContext(ctx2)
+	defer func() {
+		cancel()
+		err := g.Wait()
+		require.True(t, testutils.IsError(err, "context canceled"))
+	}()
+	observer := func(fn kvcoord.ForEachRangeFn) {
+		g.GoCtx(func(ctx context.Context) error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(200 * time.Millisecond):
+				}
+				err := fn(func(rfCtx kvcoord.RangeFeedContext, feed kvcoord.PartialRangeFeed) error {
+					curRangeFeedNodeID.Store(feed.NodeID)
+					return nil
+				})
+				if err != nil {
+					return err
+				}
+			}
+		})
+	}
+
+	// We will use this metric to observe the server-side rangefeed cancellation,
+	// which should be zero prior to the send queue developing. Then, non-zero
+	// shortly after.
+	const rangeFeedCancelMetricQueryStr = `
+  SELECT
+    name,
+    value
+  FROM crdb_internal.node_metrics
+  WHERE name LIKE 'kv.rangefeed.closed_timestamp.slow_ranges.cancelled'
+  ORDER BY name ASC;
+`
+
+	closeFeed := rangeFeed(
+		ctx,
+		ts.DistSenderI(),
+		span,
+		tc.Server(0).Clock().Now(),
+		ignoreValues,
+		kvcoord.WithRangeObserver(observer),
+	)
+	defer closeFeed()
+	testutils.SucceedsSoon(t, func() error { return checkRangeFeedNodeID(3, true /* include */) })
+	h.comment(`(Rangefeed on n3)`)
+
+	h.comment(`
+-- We will exhaust the tokens across all streams while admission is blocked on
+-- n3, using 4x1 MiB (deduction, the write itself is small) writes. Then,
+-- we will write 1 MiB to the range and wait for the closedTS to fall
+-- behind on n3. We expect that the closedTS falling behind will trigger
+-- an error that is returned to the mux rangefeed client, which will in turn 
+-- allows the rangefeed  request to be re-routed to another replica.`)
+	// Block admission on n3, while allowing every other node to admit.
+	setTokenReturnEnabled(true /* enabled */, 0, 1)
+	setTokenReturnEnabled(false /* enabled */, 2)
+	// Drain the tokens to n3 by blocking admission and issuing the buffer
+	// size of writes to the range.
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.NormalPri)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.NormalPri)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.NormalPri)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.NormalPri)
+	h.waitForTotalTrackedTokens(ctx, desc.RangeID, 4<<20 /* 4 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Observe the server-side rangefeed cancellation metric on n3, before a send
+-- queue develops, it should be zero:`)
+	h.query(n3, rangeFeedCancelMetricQueryStr)
+
+	h.comment(`(Sending 1 MiB put request to develop a send queue)`)
+	h.put(ctx, roachpb.Key(desc.StartKey), 1, admissionpb.NormalPri)
+	h.comment(`(Sent 1 MiB put request)`)
+	h.waitForTotalTrackedTokens(ctx, desc.RangeID, 4<<20 /* 4 MiB */, 0 /* serverIdx */)
+	h.waitForAllTokensReturnedForStreamsV2(ctx, 0, /* serverIdx */
+		testingMkFlowStream(0), testingMkFlowStream(1))
+	h.waitForSendQueueSize(ctx, desc.RangeID, 1<<20 /* expSize 1 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue metrics from n1, n3's send queue should have 1 MiB for s3.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.comment(`
+-- Observe the total tracked tokens per-stream on n1, s3's entries will still
+-- be tracked here.`)
+	h.query(n1, `
+  SELECT range_id, store_id, crdb_internal.humanize_bytes(total_tracked_tokens::INT8)
+    FROM crdb_internal.kv_flow_control_handles_v2
+`, "range_id", "store_id", "total_tracked_tokens")
+	h.comment(`
+-- Per-store tokens available from n1, these should reflect the lack of tokens 
+-- for s3.`)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+
+	testutils.SucceedsSoon(t, func() error {
+		return checkRangeFeedNodeID(3, false /* include */)
+	})
+	newNode := curRangeFeedNodeID.Load().(roachpb.NodeID)
+	h.comment(fmt.Sprintf(`(Rangefeed moved to n%v)`, newNode))
+
+	h.comment(`
+-- Observe the server-side rangefeed cancellation metric increased on n3:`)
+	h.query(n3, rangeFeedCancelMetricQueryStr)
+
+	h.comment(`-- (Allowing below-raft admission to proceed on n3.)`)
+	setTokenReturnEnabled(true /* enabled */, 2)
+	h.waitForAllTokensReturned(ctx, 3, 0 /* serverIdx */)
+	h.waitForSendQueueSize(ctx, desc.RangeID, 0 /* expSize 0 MiB */, 0 /* serverIdx */)
+
+	h.comment(`
+-- Send queue and flow token metrics from n1. All tokens should be returned.`)
+	h.query(n1, flowSendQueueQueryStr)
+	h.query(n1, flowPerStoreTokenQueryStr, flowPerStoreTokenQueryHeaderStrs...)
+}
+
 type flowControlTestHelper struct {
 	t             testing.TB
 	tc            *testcluster.TestCluster
@@ -5788,7 +6515,7 @@ func (h *flowControlTestHelper) checkSendQueueSize(
 	h.tc.GetFirstStoreFromServer(h.t, serverIdx).GetReplicaIfExists(rangeID).SendStreamStats(&stats)
 	_, sizeBytes := stats.SumSendQueues()
 	if sizeBytes != expSize {
-		return errors.Errorf("expected send queue size %d, got %d [%v]", expSize, sizeBytes, stats)
+		return errors.Errorf("expected send queue size %d, got %d [%v]", expSize, sizeBytes, &stats)
 	}
 	return nil
 }
@@ -5985,6 +6712,27 @@ func (h *flowControlTestHelper) waitForConnectedStreams(
 	})
 }
 
+func (h *flowControlTestHelper) computeTotalTrackedTokens(
+	ctx context.Context,
+	rangeID roachpb.RangeID,
+	serverIdx int,
+	lvl ...kvflowcontrol.V2EnabledWhenLeaderLevel,
+) (kvflowcontrol.Tokens, error) {
+	level := h.resolveLevelArgs(lvl...)
+	state, found := h.getInspectHandlesForLevel(serverIdx, level).LookupInspect(rangeID)
+	if !found {
+		return 0, fmt.Errorf("handle for %s not found", rangeID)
+	}
+	require.True(h.t, found)
+	var totalTracked int64
+	for _, stream := range state.ConnectedStreams {
+		for _, tracked := range stream.TrackedDeductions {
+			totalTracked += tracked.Tokens
+		}
+	}
+	return kvflowcontrol.Tokens(totalTracked), nil
+}
+
 func (h *flowControlTestHelper) waitForTotalTrackedTokens(
 	ctx context.Context,
 	rangeID roachpb.RangeID,
@@ -5992,22 +6740,53 @@ func (h *flowControlTestHelper) waitForTotalTrackedTokens(
 	serverIdx int,
 	lvl ...kvflowcontrol.V2EnabledWhenLeaderLevel,
 ) {
-	level := h.resolveLevelArgs(lvl...)
 	testutils.SucceedsSoon(h.t, func() error {
-		state, found := h.getInspectHandlesForLevel(serverIdx, level).LookupInspect(rangeID)
-		if !found {
-			return fmt.Errorf("handle for %s not found", rangeID)
-		}
-		require.True(h.t, found)
-		var totalTracked int64
-		for _, stream := range state.ConnectedStreams {
-			for _, tracked := range stream.TrackedDeductions {
-				totalTracked += tracked.Tokens
-			}
-		}
-		if totalTracked != expTotalTrackedTokens {
+		if totalTracked, err := h.computeTotalTrackedTokens(ctx, rangeID, serverIdx, lvl...); err != nil {
+			return err
+		} else if totalTracked != kvflowcontrol.Tokens(expTotalTrackedTokens) {
 			return fmt.Errorf("expected to track %d tokens in aggregate, got %d",
-				kvflowcontrol.Tokens(expTotalTrackedTokens), kvflowcontrol.Tokens(totalTracked))
+				kvflowcontrol.Tokens(expTotalTrackedTokens), totalTracked)
+		}
+		return nil
+	})
+}
+
+func (h *flowControlTestHelper) waitForTotalTrackedTokensGE(
+	ctx context.Context, rangeID roachpb.RangeID, expTotalTrackedTokensGE int64, serverIdx int,
+) {
+	testutils.SucceedsSoon(h.t, func() error {
+		if totalTracked, err := h.computeTotalTrackedTokens(ctx, rangeID, serverIdx); err != nil {
+			return err
+		} else if totalTracked < kvflowcontrol.Tokens(expTotalTrackedTokensGE) {
+			return fmt.Errorf("expected to track >= %d tokens in aggregate, got %d",
+				kvflowcontrol.Tokens(expTotalTrackedTokensGE), totalTracked)
+		}
+		return nil
+	})
+}
+
+func (h *flowControlTestHelper) waitForTotalTrackedTokensForDuration(
+	ctx context.Context,
+	rangeID roachpb.RangeID,
+	expTotalTrackedTokens int64,
+	serverIdx int,
+	d time.Duration,
+) {
+	testutils.SucceedsSoon(h.t, func() error {
+		for start := timeutil.Now(); timeutil.Since(start) < d; {
+			if totalTracked, err := h.computeTotalTrackedTokens(ctx, rangeID, serverIdx); err != nil {
+				return err
+			} else if totalTracked != kvflowcontrol.Tokens(expTotalTrackedTokens) {
+				return fmt.Errorf("expected to track %d tokens in aggregate, got %d",
+					kvflowcontrol.Tokens(expTotalTrackedTokens), totalTracked)
+			} else {
+				select {
+				// Avoid spinning.
+				case <-time.After(200 * time.Millisecond):
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 		}
 		return nil
 	})
@@ -6133,6 +6912,46 @@ func (h *flowControlTestHelper) query(runner *sqlutils.SQLRunner, sql string, he
 	tbl.SetHeader(headers)
 	tbl.SetAutoFormatHeaders(false)
 	tbl.Render()
+}
+
+type testingSendResult struct {
+	serverIdx int
+	*kvpb.Error
+	*kvpb.BatchResponse
+}
+
+// putAsync issues a put request for the given key at the priority specified,
+// against the first server in the cluster. Unlike put, this function does not
+// wait for the request to be processed. It returns a cancel function and a
+// channel to receive the result of the request(s).
+func (h *flowControlTestHelper) putAsync(
+	ctx context.Context, key roachpb.Key, size int, pri admissionpb.WorkPriority, serverIdxs ...int,
+) (context.CancelFunc, chan testingSendResult) {
+	if len(serverIdxs) == 0 {
+		// Default to the first server if none are given.
+		serverIdxs = []int{0}
+	}
+	// Generate the values now, so that we don't race on the rand source inside
+	// the function below.
+	values := make([]roachpb.Value, len(serverIdxs))
+	for i := range serverIdxs {
+		values[i] = roachpb.MakeValueFromString(randutil.RandString(h.rng, size, randutil.PrintableKeyAlphabet))
+	}
+	resCh := make(chan testingSendResult, len(serverIdxs))
+	cancelCtx, cancel := context.WithCancel(ctx)
+	for _, serverIdx := range serverIdxs {
+		require.NoError(h.t, h.tc.Server(serverIdx).Stopper().RunAsyncTask(cancelCtx,
+			fmt.Sprintf("put-async-idx-%d", serverIdx), func(ctx context.Context) {
+				value := values[serverIdx]
+				ba := &kvpb.BatchRequest{}
+				ba.Add(kvpb.NewPut(key, value))
+				ba.AdmissionHeader.Priority = int32(pri)
+				ba.AdmissionHeader.Source = kvpb.AdmissionHeader_FROM_SQL
+				br, pErr := h.tc.Server(serverIdx).DB().NonTransactionalSender().Send(cancelCtx, ba)
+				resCh <- testingSendResult{serverIdx: serverIdx, Error: pErr, BatchResponse: br}
+			}))
+	}
+	return cancel, resCh
 }
 
 // put issues a put request for the given key at the priority specified,

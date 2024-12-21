@@ -19,7 +19,7 @@ import (
 )
 
 type controlJobsNode struct {
-	rows          planNode
+	singleInputPlanNode
 	desiredStatus jobs.Status
 	numRows       int
 	reason        string
@@ -31,7 +31,7 @@ var jobCommandToDesiredStatus = map[tree.JobCommand]jobs.Status{
 	tree.PauseJob:  jobs.StatusPaused,
 }
 
-// FastPathResults implements the planNodeFastPath inteface.
+// FastPathResults implements the planNodeFastPath interface.
 func (n *controlJobsNode) FastPathResults() (int, bool) {
 	return n.numRows, true
 }
@@ -48,7 +48,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 		return err
 	}
 	for {
-		ok, err := n.rows.Next(params)
+		ok, err := n.input.Next(params)
 		if err != nil {
 			return err
 		}
@@ -56,7 +56,7 @@ func (n *controlJobsNode) startExec(params runParams) error {
 			break
 		}
 
-		jobIDDatum := n.rows.Values()[0]
+		jobIDDatum := n.input.Values()[0]
 		if jobIDDatum == tree.DNull {
 			continue
 		}
@@ -104,5 +104,5 @@ func (*controlJobsNode) Next(runParams) (bool, error) { return false, nil }
 func (*controlJobsNode) Values() tree.Datums { return nil }
 
 func (n *controlJobsNode) Close(ctx context.Context) {
-	n.rows.Close(ctx)
+	n.input.Close(ctx)
 }

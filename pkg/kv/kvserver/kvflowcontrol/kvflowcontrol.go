@@ -18,8 +18,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxutil"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/redact"
-	"github.com/dustin/go-humanize"
 )
 
 // Enabled determines whether we use flow control for replication traffic in KV.
@@ -40,7 +42,11 @@ var Mode = settings.RegisterEnumSetting(
 	settings.SystemOnly,
 	"kvadmission.flow_control.mode",
 	"determines the 'mode' of flow control we use for replication traffic in KV, if enabled",
-	modeDict[ApplyToElastic], /* default value */
+	metamorphic.ConstantWithTestChoice(
+		"kvadmission.flow_control.mode",
+		modeDict[ApplyToAll],     /* default value */
+		modeDict[ApplyToElastic], /* other value */
+	),
 	modeDict,
 )
 
@@ -69,12 +75,12 @@ func (m ModeT) String() string {
 }
 
 // SafeFormat implements the redact.SafeFormatter interface.
-func (m ModeT) SafeFormat(p redact.SafePrinter, verb rune) {
+func (m ModeT) SafeFormat(p redact.SafePrinter, _ rune) {
 	if s, ok := modeDict[m]; ok {
-		p.Print(s)
+		p.SafeString(redact.SafeString(s))
 		return
 	}
-	p.Print("unknown-mode")
+	p.SafeString("unknown-mode")
 }
 
 // RegularTokensPerStream determines the flow tokens available for regular work
@@ -414,13 +420,12 @@ func (t Tokens) String() string {
 }
 
 // SafeFormat implements the redact.SafeFormatter interface.
-func (t Tokens) SafeFormat(p redact.SafePrinter, verb rune) {
-	sign := "+"
+func (t Tokens) SafeFormat(p redact.SafePrinter, _ rune) {
 	if t < 0 {
-		sign = "-"
-		t = -t
+		p.SafeString(humanizeutil.IBytes(int64(t)))
+		return
 	}
-	p.Printf("%s%s", sign, humanize.IBytes(uint64(t)))
+	p.Printf("+%s", humanizeutil.IBytes(int64(t)))
 }
 
 func (s Stream) String() string {
@@ -428,15 +433,15 @@ func (s Stream) String() string {
 }
 
 // SafeFormat implements the redact.SafeFormatter interface.
-func (s Stream) SafeFormat(p redact.SafePrinter, verb rune) {
+func (s Stream) SafeFormat(p redact.SafePrinter, _ rune) {
 	tenantSt := s.TenantID.String()
 	if s.TenantID.IsSystem() {
 		tenantSt = "1"
 	}
-	p.Printf("t%s/s%s", tenantSt, s.StoreID.String())
+	p.Printf("t%s/s%s", redact.SafeString(tenantSt), s.StoreID)
 }
 
-type raftAdmissionMetaKey struct{}
+var raftAdmissionMetaKey = ctxutil.RegisterFastValueKey()
 
 // ContextWithMeta returns a Context wrapping the supplied raft admission meta,
 // if any.
@@ -445,7 +450,7 @@ type raftAdmissionMetaKey struct{}
 // #104154.
 func ContextWithMeta(ctx context.Context, meta *kvflowcontrolpb.RaftAdmissionMeta) context.Context {
 	if meta != nil {
-		ctx = context.WithValue(ctx, raftAdmissionMetaKey{}, meta)
+		ctx = ctxutil.WithFastValue(ctx, raftAdmissionMetaKey, meta)
 	}
 	return ctx
 }
@@ -453,7 +458,7 @@ func ContextWithMeta(ctx context.Context, meta *kvflowcontrolpb.RaftAdmissionMet
 // MetaFromContext returns the raft admission meta embedded in the Context, if
 // any.
 func MetaFromContext(ctx context.Context) *kvflowcontrolpb.RaftAdmissionMeta {
-	val := ctx.Value(raftAdmissionMetaKey{})
+	val := ctxutil.FastValue(ctx, raftAdmissionMetaKey)
 	h, ok := val.(*kvflowcontrolpb.RaftAdmissionMeta)
 	if !ok {
 		return nil

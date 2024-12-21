@@ -773,7 +773,7 @@ func (r *raft) maybeSendSnapshot(to pb.PeerID, pr *tracker.Progress) bool {
 	sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
 	r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
 		r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
-	pr.BecomeSnapshot(sindex)
+	r.becomeSnapshot(pr, sindex)
 	r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
 
 	r.send(pb.Message{To: to, Type: pb.MsgSnap, Snapshot: &snapshot})
@@ -1262,31 +1262,9 @@ func (r *raft) tickHeartbeat() {
 	}
 }
 
-// TODO(arul): Consider removing the lead argument from this function. Instead,
-// for all the methods that want to set the leader explicitly (the ones that are
-// passing in m.From for this field), we can instead have them use an assignLead
-// function instead; in there, we can add safety checks to ensure we're not
-// overwriting the leader.
 func (r *raft) becomeFollower(term uint64, lead pb.PeerID) {
-	if r.leadEpoch == 0 && lead == r.id {
-		// A non-zero lead epoch indicates that the leader fortified its term.
-		// Fortification promises should hold true even if the leader steps down, so
-		// as the leader, we remember that we were the leader even after we step
-		// down.
-		//
-		// In cases where the leader wasn't fortified prior to stepping down, we
-		// eschew remembering that we were the leader. This maintains parity with
-		// the behavior of leaders stepping down before the fortification protocol
-		// was introduced. This gives us time to stabilize the following state as
-		// the v24.3 release is rolled out:
-		//
-		//   r.state = StateFollower && r.lead = r.id
-		//
-		// Once this state is stabilized (within and above pkg/raft), we can remove
-		// this special case.
-		r.lead = None
-		lead = None
-	}
+	assertTrue(lead != r.id, "should not be stepping down to a follower when the lead field points to us")
+
 	r.state = pb.StateFollower
 	r.step = stepFollower
 	r.tick = r.tickElection
@@ -1355,15 +1333,26 @@ func (r *raft) becomeLeader() {
 	r.tick = r.tickHeartbeat
 	r.setLead(r.id)
 	r.state = pb.StateLeader
-	// Followers enter replicate mode when they've been successfully probed
-	// (perhaps after having received a snapshot as a result). The leader is
-	// trivially in this state. Note that r.reset() has initialized this
-	// progress with the last index already.
-	pr := r.trk.Progress(r.id)
-	pr.BecomeReplicate()
-	// The leader always has RecentActive == true. The checkQuorumActive method
-	// makes sure to preserve this.
-	pr.RecentActive = true
+	// TODO(pav-kv): r.reset already scans the peers. Try avoiding another scan.
+	r.trk.Visit(func(id pb.PeerID, pr *tracker.Progress) {
+		if id == r.id {
+			// Followers enter replicate mode when they've been successfully probed
+			// (perhaps after having received a snapshot as a result). The leader is
+			// trivially in this state. Note that r.reset() has initialized this
+			// progress with the last index already.
+			r.becomeReplicate(pr)
+			// The leader always has RecentActive == true. The checkQuorumActive
+			// method makes sure to preserve this.
+			pr.RecentActive = true
+			return
+		}
+		// All peer flows, except the leader's own, are initially in StateProbe.
+		// Account the probe state entering in metrics here. All subsequent flow
+		// state changes, while we are the leader, are counted in the corresponding
+		// methods: becomeProbe, becomeReplicate, becomeSnapshot.
+		assertTrue(pr.State == tracker.StateProbe, "peers must be in StateProbe on leader step up")
+		r.metrics.FlowsEnteredStateProbe.Inc(1)
+	})
 
 	// Conservatively set the pendingConfIndex to the last index in the
 	// log. There may or may not be a pending config change, but it's
@@ -1382,6 +1371,21 @@ func (r *raft) becomeLeader() {
 	// quota of the new leader. In other words, after the call to appendEntry,
 	// r.uncommittedSize is still 0.
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
+}
+
+func (r *raft) becomeProbe(pr *tracker.Progress) {
+	r.metrics.FlowsEnteredStateProbe.Inc(1)
+	pr.BecomeProbe()
+}
+
+func (r *raft) becomeReplicate(pr *tracker.Progress) {
+	r.metrics.FlowsEnteredStateReplicate.Inc(1)
+	pr.BecomeReplicate()
+}
+
+func (r *raft) becomeSnapshot(pr *tracker.Progress, index uint64) {
+	r.metrics.FlowsEnteredStateSnapshot.Inc(1)
+	pr.BecomeSnapshot(index)
 }
 
 func (r *raft) hup(t CampaignType) {
@@ -2035,7 +2039,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			if pr.MaybeDecrTo(m.Index, nextProbeIdx) {
 				r.logger.Debugf("%x decreased progress of %x to [%s]", r.id, m.From, pr)
 				if pr.State == tracker.StateReplicate {
-					pr.BecomeProbe()
+					r.becomeProbe(pr)
 				}
 				r.maybeSendAppend(m.From)
 			}
@@ -2051,7 +2055,7 @@ func stepLeader(r *raft, m pb.Message) error {
 			if pr.MaybeUpdate(m.Index) || (pr.Match == m.Index && pr.State == tracker.StateProbe) {
 				switch {
 				case pr.State == tracker.StateProbe:
-					pr.BecomeReplicate()
+					r.becomeReplicate(pr)
 				case pr.State == tracker.StateSnapshot && pr.Match+1 >= r.raftLog.firstIndex():
 					// Note that we don't take into account PendingSnapshot to
 					// enter this branch. No matter at which index a snapshot
@@ -2065,8 +2069,8 @@ func stepLeader(r *raft, m pb.Message) error {
 					// move to replicating state, that would only happen with
 					// the next round of appends (but there may not be a next
 					// round for a while, exposing an inconsistent RaftStatus).
-					pr.BecomeProbe()
-					pr.BecomeReplicate()
+					r.becomeProbe(pr)
+					r.becomeReplicate(pr)
 				case pr.State == tracker.StateReplicate:
 					pr.Inflights.FreeLE(m.Index)
 				}
@@ -2111,13 +2115,13 @@ func stepLeader(r *raft, m pb.Message) error {
 			return nil
 		}
 		if !m.Reject {
-			pr.BecomeProbe()
+			r.becomeProbe(pr)
 			r.logger.Debugf("%x snapshot succeeded, resumed sending replication messages to %x [%s]", r.id, m.From, pr)
 		} else {
 			// NB: the order here matters or we'll be probing erroneously from
 			// the snapshot index, but the snapshot never applied.
 			pr.PendingSnapshot = 0
-			pr.BecomeProbe()
+			r.becomeProbe(pr)
 			r.logger.Debugf("%x snapshot failed, resumed sending replication messages to %x [%s]", r.id, m.From, pr)
 		}
 		// If snapshot finish, wait for the MsgAppResp from the remote node before sending
@@ -2128,7 +2132,7 @@ func stepLeader(r *raft, m pb.Message) error {
 		// During optimistic replication, if the remote becomes unreachable,
 		// there is huge probability that a MsgApp is lost.
 		if pr.State == tracker.StateReplicate {
-			pr.BecomeProbe()
+			r.becomeProbe(pr)
 		}
 		r.logger.Debugf("%x failed to send message to %x because it is unreachable [%s]", r.id, m.From, pr)
 	case pb.MsgTransferLeader:
@@ -2900,7 +2904,10 @@ func (r *raft) testingStepDown() error {
 	if r.lead != r.id {
 		return errors.New("cannot step down if not the leader")
 	}
-	r.becomeFollower(r.Term, r.id) // mirror the logic in how we step down when CheckQuorum fails
+	// De-fortify ourselves before stepping down to forget the lead epoch.
+	// Otherwise, the leadEpoch may be set when the lead field isn't.
+	r.deFortify(r.id, r.Term)
+	r.becomeFollower(r.Term, None)
 	return nil
 }
 

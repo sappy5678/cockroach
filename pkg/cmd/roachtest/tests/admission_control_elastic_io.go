@@ -40,9 +40,8 @@ func registerElasticIO(r registry.Registry) {
 		Suites: registry.Suites(registry.Nightly),
 		// Tags:      registry.Tags(`weekly`),
 		// Second node is solely for Prometheus.
-		Cluster:         r.MakeClusterSpec(2, spec.CPU(8), spec.WorkloadNode()),
-		RequiresLicense: true,
-		Leases:          registry.MetamorphicLeases,
+		Cluster: r.MakeClusterSpec(2, spec.CPU(8), spec.WorkloadNode()),
+		Leases:  registry.MetamorphicLeases,
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			if c.IsLocal() {
 				t.Skip("IO overload test is not meant to run locally")
@@ -124,6 +123,11 @@ func registerElasticIO(r registry.Registry) {
 				// Sleep initially for stability to be achieved, before measuring.
 				time.Sleep(5 * time.Minute)
 				for {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+					}
 					time.Sleep(10 * time.Second)
 					val, err := getMetricVal(subLevelMetric)
 					if err != nil {

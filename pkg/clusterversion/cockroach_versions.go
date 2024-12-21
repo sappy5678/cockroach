@@ -198,6 +198,18 @@ const (
 	// range-ID local key, which is written below raft.
 	V25_1_AddRangeForceFlushKey
 
+	// V25_1_BatchStreamRPC adds the BatchStream RPC, which allows for more
+	// efficient Batch unary RPCs.
+	V25_1_BatchStreamRPC
+
+	// V25_1_PreparedTransactionsTable adds the system.prepared_transactions
+	// table. The table is used to store information about prepared transaction
+	// that are part of the XA two-phase commit protocol.
+	V25_1_PreparedTransactionsTable
+
+	// V25_1_AddJobsColumns added new columns to system.jobs.
+	V25_1_AddJobsColumns
+
 	// *************************************************
 	// Step (1) Add new versions above this comment.
 	// Do not add new versions to a patch release.
@@ -237,9 +249,12 @@ var versionTable = [numKeys]roachpb.Version{
 	// v25.1 versions. Internal versions must be even.
 	V25_1_Start: {Major: 24, Minor: 3, Internal: 2},
 
-	V25_1_AddJobsTables:          {Major: 24, Minor: 3, Internal: 4},
-	V25_1_MoveRaftTruncatedState: {Major: 24, Minor: 3, Internal: 6},
-	V25_1_AddRangeForceFlushKey:  {Major: 24, Minor: 3, Internal: 8},
+	V25_1_AddJobsTables:             {Major: 24, Minor: 3, Internal: 4},
+	V25_1_MoveRaftTruncatedState:    {Major: 24, Minor: 3, Internal: 6},
+	V25_1_AddRangeForceFlushKey:     {Major: 24, Minor: 3, Internal: 8},
+	V25_1_BatchStreamRPC:            {Major: 24, Minor: 3, Internal: 10},
+	V25_1_PreparedTransactionsTable: {Major: 24, Minor: 3, Internal: 12},
+	V25_1_AddJobsColumns:            {Major: 24, Minor: 3, Internal: 14},
 
 	// *************************************************
 	// Step (2): Add new versions above this comment.
@@ -285,8 +300,21 @@ const DevelopmentBranch = true
 // TestFinalVersion).
 const finalVersion Key = -1
 
+// TestingExtraVersions may be set to true by packages of tests which will
+// intentionally use Keys greater than Latest, which otherwise would crash
+// and/or cause errors. This should only be done in packages of tests
+// specifically focused on upgrade infrastructure, as it may make mistaken use
+// of Keys greater than latest, which would likely cause odd behavior, harder to
+// notice and debug.
+var TestingExtraVersions = false
+
 // Version returns the roachpb.Version corresponding to a key.
 func (k Key) Version() roachpb.Version {
+	if TestingExtraVersions && k > Latest {
+		v := versionTable[Latest]
+		v.Internal += int32(k-Latest) * 2
+		return maybeApplyDevOffset(k, v)
+	}
 	version := versionTable[k]
 	return maybeApplyDevOffset(k, version)
 }

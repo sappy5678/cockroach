@@ -30,6 +30,7 @@ import (
 // explainPlanNode implements EXPLAIN (PLAN) and EXPLAIN (DISTSQL); it produces
 // the output of EXPLAIN given an explain.Plan.
 type explainPlanNode struct {
+	zeroInputPlanNode
 	optColumnsSlot
 
 	options *tree.ExplainOptions
@@ -59,7 +60,7 @@ func (e *explainPlanNode) startExec(params runParams) error {
 		// created).
 		distribution, _ := getPlanDistribution(
 			params.ctx, params.p.Descriptors().HasUncommittedTypes(),
-			params.extendedEvalCtx.SessionData().DistSQLMode, plan.main, &params.p.distSQLVisitor,
+			params.extendedEvalCtx.SessionData(), plan.main, &params.p.distSQLVisitor,
 		)
 
 		outerSubqueries := params.p.curPlan.subqueryPlans

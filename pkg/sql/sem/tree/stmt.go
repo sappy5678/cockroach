@@ -86,6 +86,7 @@ const (
 
 const (
 	AlterTableTag          = "ALTER TABLE"
+	AlterPolicyTag         = "ALTER POLICY"
 	BackupTag              = "BACKUP"
 	CreateIndexTag         = "CREATE INDEX"
 	CreateFunctionTag      = "CREATE FUNCTION"
@@ -94,6 +95,7 @@ const (
 	CreateSchemaTag        = "CREATE SCHEMA"
 	CreateSequenceTag      = "CREATE SEQUENCE"
 	CreateDatabaseTag      = "CREATE DATABASE"
+	CreatePolicyTag        = "CREATE POLICY"
 	CommentOnColumnTag     = "COMMENT ON COLUMN"
 	CommentOnConstraintTag = "COMMENT ON CONSTRAINT"
 	CommentOnDatabaseTag   = "COMMENT ON DATABASE"
@@ -103,6 +105,7 @@ const (
 	CommentOnTypeTag       = "COMMENT ON TYPE"
 	DropDatabaseTag        = "DROP DATABASE"
 	DropFunctionTag        = "DROP FUNCTION"
+	DropPolicyTag          = "DROP POLICY"
 	DropProcedureTag       = "DROP PROCEDURE"
 	DropTriggerTag         = "DROP TRIGGER"
 	DropIndexTag           = "DROP INDEX"
@@ -444,6 +447,20 @@ func (*AlterIndexVisible) StatementTag() string { return "ALTER INDEX" }
 func (*AlterIndexVisible) hiddenFromShowQueries() {}
 
 // StatementReturnType implements the Statement interface.
+func (*AlterPolicy) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*AlterPolicy) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*AlterPolicy) StatementTag() string { return AlterPolicyTag }
+
+func (*AlterPolicy) hiddenFromShowQueries() {}
+
+// modifiesSchema implements the canModifySchema interface.
+func (*AlterPolicy) modifiesSchema() bool { return true }
+
+// StatementReturnType implements the Statement interface.
 func (*AlterTable) StatementReturnType() StatementReturnType { return DDL }
 
 // StatementType implements the Statement interface.
@@ -751,7 +768,7 @@ func (*CannedOptPlan) StatementTag() string { return "PREPARE AS OPT PLAN" }
 func (*CloseCursor) StatementReturnType() StatementReturnType { return Ack }
 
 // StatementType implements the Statement interface.
-func (*CloseCursor) StatementType() StatementType { return TypeDCL }
+func (*CloseCursor) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CloseCursor) StatementTag() string { return "CLOSE" }
@@ -818,6 +835,15 @@ func (*CommentOnType) StatementType() StatementType { return TypeDDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CommentOnType) StatementTag() string { return CommentOnTypeTag }
+
+// StatementReturnType implements the Statement interface.
+func (*CommitPrepared) StatementReturnType() StatementReturnType { return Ack }
+
+// StatementType implements the Statement interface.
+func (*CommitPrepared) StatementType() StatementType { return TypeTCL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CommitPrepared) StatementTag() string { return "COMMIT PREPARED" }
 
 // StatementReturnType implements the Statement interface.
 func (*CommitTransaction) StatementReturnType() StatementReturnType { return Ack }
@@ -954,6 +980,20 @@ func (*CreateIndex) StatementType() StatementType { return TypeDDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*CreateIndex) StatementTag() string { return CreateIndexTag }
+
+// StatementReturnType implements the Statement interface.
+func (*CreatePolicy) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*CreatePolicy) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*CreatePolicy) StatementTag() string { return CreatePolicyTag }
+
+func (*CreatePolicy) hiddenFromShowQueries() {}
+
+// modifiesSchema implements the canModifySchema interface.
+func (*CreatePolicy) modifiesSchema() bool { return true }
 
 // StatementReturnType implements the Statement interface.
 func (n *CreateSchema) StatementReturnType() StatementReturnType { return DDL }
@@ -1103,6 +1143,20 @@ func (*DropIndex) StatementType() StatementType { return TypeDDL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*DropIndex) StatementTag() string { return DropIndexTag }
+
+// StatementReturnType implements the Statement interface.
+func (*DropPolicy) StatementReturnType() StatementReturnType { return DDL }
+
+// StatementType implements the Statement interface.
+func (*DropPolicy) StatementType() StatementType { return TypeDDL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*DropPolicy) StatementTag() string { return DropPolicyTag }
+
+func (*DropPolicy) hiddenFromShowQueries() {}
+
+// modifiesSchema implements the canModifySchema interface.
+func (*DropPolicy) modifiesSchema() bool { return true }
 
 // StatementReturnType implements the Statement interface.
 func (*DropTable) StatementReturnType() StatementReturnType { return DDL }
@@ -1291,6 +1345,15 @@ func (*Prepare) StatementType() StatementType { return TypeTCL }
 func (*Prepare) StatementTag() string { return "PREPARE" }
 
 // StatementReturnType implements the Statement interface.
+func (*PrepareTransaction) StatementReturnType() StatementReturnType { return Ack }
+
+// StatementType implements the Statement interface.
+func (*PrepareTransaction) StatementType() StatementType { return TypeTCL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*PrepareTransaction) StatementTag() string { return "PREPARE TRANSACTION" }
+
+// StatementReturnType implements the Statement interface.
 func (*ReassignOwnedBy) StatementReturnType() StatementReturnType { return DDL }
 
 // StatementType implements the Statement interface.
@@ -1437,6 +1500,15 @@ func (*RevokeRole) StatementType() StatementType { return TypeDCL }
 
 // StatementTag returns a short string identifying the type of statement.
 func (*RevokeRole) StatementTag() string { return "REVOKE" }
+
+// StatementReturnType implements the Statement interface.
+func (*RollbackPrepared) StatementReturnType() StatementReturnType { return Ack }
+
+// StatementType implements the Statement interface.
+func (*RollbackPrepared) StatementType() StatementType { return TypeTCL }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*RollbackPrepared) StatementTag() string { return "ROLLBACK PREPARED" }
 
 // StatementReturnType implements the Statement interface.
 func (*RollbackToSavepoint) StatementReturnType() StatementReturnType { return Ack }
@@ -1753,6 +1825,15 @@ func (*ShowPartitions) StatementType() StatementType { return TypeDML }
 
 // StatementTag returns a short string identifying the type of the statement.
 func (*ShowPartitions) StatementTag() string { return "SHOW PARTITIONS" }
+
+// StatementReturnType implements the Statement interface.
+func (*ShowPolicies) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowPolicies) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of the statement.
+func (*ShowPolicies) StatementTag() string { return "SHOW POLICIES" }
 
 // StatementReturnType implements the Statement interface.
 func (*ShowQueries) StatementReturnType() StatementReturnType { return Rows }
@@ -2348,6 +2429,7 @@ func (n *AlterDatabaseDropSecondaryRegion) String() string    { return AsString(
 func (n *AlterDatabaseSetZoneConfigExtension) String() string { return AsString(n) }
 func (n *AlterDefaultPrivileges) String() string              { return AsString(n) }
 func (n *AlterFunctionOptions) String() string                { return AsString(n) }
+func (n *AlterPolicy) String() string                         { return AsString(n) }
 func (n *AlterRoutineRename) String() string                  { return AsString(n) }
 func (n *AlterRoutineSetSchema) String() string               { return AsString(n) }
 func (n *AlterRoutineSetOwner) String() string                { return AsString(n) }
@@ -2399,6 +2481,7 @@ func (n *CommentOnSchema) String() string                     { return AsString(
 func (n *CommentOnIndex) String() string                      { return AsString(n) }
 func (n *CommentOnTable) String() string                      { return AsString(n) }
 func (n *CommentOnType) String() string                       { return AsString(n) }
+func (n *CommitPrepared) String() string                      { return AsString(n) }
 func (n *CommitTransaction) String() string                   { return AsString(n) }
 func (n *CopyFrom) String() string                            { return AsString(n) }
 func (n *CopyTo) String() string                              { return AsString(n) }
@@ -2409,6 +2492,7 @@ func (n *CreateRoutine) String() string                       { return AsString(
 func (n *CreateTrigger) String() string                       { return AsString(n) }
 func (n *CreateIndex) String() string                         { return AsString(n) }
 func (n *CreateLogicalReplicationStream) String() string      { return AsString(n) }
+func (n *CreatePolicy) String() string                        { return AsString(n) }
 func (n *CreateRole) String() string                          { return AsString(n) }
 func (n *CreateTable) String() string                         { return AsString(n) }
 func (n *CreateTenant) String() string                        { return AsString(n) }
@@ -2421,6 +2505,7 @@ func (n *Deallocate) String() string                          { return AsString(
 func (n *Delete) String() string                              { return AsString(n) }
 func (n *DeclareCursor) String() string                       { return AsString(n) }
 func (n *DropDatabase) String() string                        { return AsString(n) }
+func (n *DropPolicy) String() string                          { return AsString(n) }
 func (n *DropRoutine) String() string                         { return AsString(n) }
 func (n *DropTrigger) String() string                         { return AsString(n) }
 func (n *DropIndex) String() string                           { return AsString(n) }
@@ -2447,6 +2532,7 @@ func (n *Import) String() string                              { return AsString(
 func (n *LiteralValuesClause) String() string                 { return AsString(n) }
 func (n *ParenSelect) String() string                         { return AsString(n) }
 func (n *Prepare) String() string                             { return AsString(n) }
+func (n *PrepareTransaction) String() string                  { return AsString(n) }
 func (n *ReassignOwnedBy) String() string                     { return AsString(n) }
 func (n *ReleaseSavepoint) String() string                    { return AsString(n) }
 func (n *Relocate) String() string                            { return AsString(n) }
@@ -2461,6 +2547,7 @@ func (n *Restore) String() string                             { return AsString(
 func (n *RoutineReturn) String() string                       { return AsString(n) }
 func (n *Revoke) String() string                              { return AsString(n) }
 func (n *RevokeRole) String() string                          { return AsString(n) }
+func (n *RollbackPrepared) String() string                    { return AsString(n) }
 func (n *RollbackToSavepoint) String() string                 { return AsString(n) }
 func (n *RollbackTransaction) String() string                 { return AsString(n) }
 func (n *Savepoint) String() string                           { return AsString(n) }
@@ -2504,6 +2591,7 @@ func (n *ShowJobs) String() string                            { return AsString(
 func (n *ShowChangefeedJobs) String() string                  { return AsString(n) }
 func (n *ShowLastQueryStatistics) String() string             { return AsString(n) }
 func (n *ShowPartitions) String() string                      { return AsString(n) }
+func (n *ShowPolicies) String() string                        { return AsString(n) }
 func (n *ShowQueries) String() string                         { return AsString(n) }
 func (n *ShowRanges) String() string                          { return AsString(n) }
 func (n *ShowRangeForRow) String() string                     { return AsString(n) }

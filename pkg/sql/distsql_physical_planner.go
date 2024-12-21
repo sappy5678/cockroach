@@ -46,11 +46,13 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondatapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/span"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/intsets"
@@ -395,7 +397,7 @@ const (
 	cannotDistribute distRecommendation = iota
 
 	// canDistribute indicates that a plan can be distributed, but it's not
-	// clear whether it'll be benefit from that.
+	// clear whether it'll benefit from that.
 	canDistribute
 
 	// shouldDistribute indicates that a plan will likely benefit if distributed.
@@ -430,13 +432,23 @@ func newQueryNotSupportedErrorf(format string, args ...interface{}) error {
 	return &queryNotSupportedError{msg: fmt.Sprintf(format, args...)}
 }
 
-// planNodeNotSupportedErr is the catch-all error value returned from
-// checkSupportForPlanNode when a planNode type does not support distributed
-// execution.
-var planNodeNotSupportedErr = newQueryNotSupportedError("unsupported node")
-
-var cannotDistributeRowLevelLockingErr = newQueryNotSupportedError(
-	"scans with row-level locking are not supported by distsql",
+var (
+	// planNodeNotSupportedErr is the catch-all error value returned from
+	// checkSupportForPlanNode when a planNode type does not support distributed
+	// execution.
+	planNodeNotSupportedErr            = newQueryNotSupportedError("unsupported node")
+	cannotDistributeRowLevelLockingErr = newQueryNotSupportedError(
+		"scans with row-level locking are not supported by distsql",
+	)
+	invertedFilterNotDistributableErr = newQueryNotSupportedError(
+		"inverted filter is only distributable when it's a union of spans",
+	)
+	localityOptimizedOpNotDistributableErr = newQueryNotSupportedError(
+		"locality-optimized operation cannot be distributed",
+	)
+	ordinalityNotDistributableErr = newQueryNotSupportedError(
+		"ordinality operation cannot be distributed",
+	)
 )
 
 // mustWrapNode returns true if a node has no DistSQL-processor equivalent.
@@ -511,8 +523,18 @@ func mustWrapValuesNode(planCtx *PlanningCtx, specifiedInQuery bool) bool {
 // this plan couldn't be distributed.
 // TODO(radu): add tests for this.
 func checkSupportForPlanNode(
-	node planNode, distSQLVisitor *distSQLExprCheckVisitor,
-) (distRecommendation, error) {
+	ctx context.Context,
+	node planNode,
+	distSQLVisitor *distSQLExprCheckVisitor,
+	sd *sessiondata.SessionData,
+) (retRec distRecommendation, retErr error) {
+	if buildutil.CrdbTestBuild {
+		defer func() {
+			if retRec == cannotDistribute && retErr == nil {
+				panic(errors.AssertionFailedf("all 'cannotDistribute' recommendations must be accompanied by an error"))
+			}
+		}()
+	}
 	switch n := node.(type) {
 	// Keep these cases alphabetized, please!
 	case *createStatsNode:
@@ -522,19 +544,19 @@ func checkSupportForPlanNode(
 		return shouldDistribute, nil
 
 	case *distinctNode:
-		return checkSupportForPlanNode(n.plan, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *exportNode:
-		return checkSupportForPlanNode(n.source, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *filterNode:
 		if err := checkExprForDistSQL(n.filter, distSQLVisitor); err != nil {
 			return cannotDistribute, err
 		}
-		return checkSupportForPlanNode(n.source.plan, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *groupNode:
-		rec, err := checkSupportForPlanNode(n.plan, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
@@ -543,8 +565,17 @@ func checkSupportForPlanNode(
 				return cannotDistribute, newQueryNotSupportedErrorf("aggregate %q cannot be executed with distsql", agg.funcName)
 			}
 		}
-		// Distribute aggregations if possible.
-		return rec.compose(shouldDistribute), nil
+		// Don't force distribution if we expect to process small number of
+		// rows.
+		aggRec := canDistribute
+		if n.estimatedInputRowCount == 0 {
+			log.VEventf(ctx, 2, "aggregation (no stats) recommends plan distribution")
+			aggRec = shouldDistribute
+		} else if n.estimatedInputRowCount >= sd.DistributeGroupByRowCountThreshold {
+			log.VEventf(ctx, 2, "large aggregation recommends plan distribution")
+			aggRec = shouldDistribute
+		}
+		return rec.compose(aggRec), nil
 
 	case *indexJoinNode:
 		if n.table.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
@@ -556,13 +587,13 @@ func checkSupportForPlanNode(
 		}
 		// n.table doesn't have meaningful spans, but we need to check support (e.g.
 		// for any filtering expression).
-		if _, err := checkSupportForPlanNode(n.table, distSQLVisitor); err != nil {
+		if _, err := checkSupportForPlanNode(ctx, n.table, distSQLVisitor, sd); err != nil {
 			return cannotDistribute, err
 		}
-		return checkSupportForPlanNode(n.input, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *invertedFilterNode:
-		return checkSupportForInvertedFilterNode(n, distSQLVisitor)
+		return checkSupportForInvertedFilterNode(ctx, n, distSQLVisitor, sd)
 
 	case *invertedJoinNode:
 		if n.table.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
@@ -575,30 +606,37 @@ func checkSupportForPlanNode(
 		if err := checkExprForDistSQL(n.onExpr, distSQLVisitor); err != nil {
 			return cannotDistribute, err
 		}
-		rec, err := checkSupportForPlanNode(n.input, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
+		// TODO(yuzefovich): we might want to be smarter about this and don't
+		// force distribution with small inputs.
+		log.VEventf(ctx, 2, "inverted join recommends plan distribution")
 		return rec.compose(shouldDistribute), nil
 
 	case *joinNode:
 		if err := checkExprForDistSQL(n.pred.onCond, distSQLVisitor); err != nil {
 			return cannotDistribute, err
 		}
-		recLeft, err := checkSupportForPlanNode(n.left.plan, distSQLVisitor)
+		recLeft, err := checkSupportForPlanNode(ctx, n.left, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		recRight, err := checkSupportForPlanNode(n.right.plan, distSQLVisitor)
+		recRight, err := checkSupportForPlanNode(ctx, n.right, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		// If either the left or the right side can benefit from distribution, we
-		// should distribute.
 		rec := recLeft.compose(recRight)
-		// If we can do a hash join, we distribute if possible.
 		if len(n.pred.leftEqualityIndices) > 0 {
-			rec = rec.compose(shouldDistribute)
+			// We can partition both streams on the equality columns.
+			if n.estimatedLeftRowCount == 0 && n.estimatedRightRowCount == 0 {
+				log.VEventf(ctx, 2, "join (no stats) recommends plan distribution")
+				rec = rec.compose(shouldDistribute)
+			} else if n.estimatedLeftRowCount+n.estimatedRightRowCount >= sd.DistributeJoinRowCountThreshold {
+				log.VEventf(ctx, 2, "large join recommends plan distribution")
+				rec = rec.compose(shouldDistribute)
+			}
 		}
 		return rec, nil
 
@@ -606,12 +644,12 @@ func checkSupportForPlanNode(
 		// Note that we don't need to check whether we support distribution of
 		// n.countExpr or n.offsetExpr because those expressions are evaluated
 		// locally, during the physical planning.
-		return checkSupportForPlanNode(n.plan, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *lookupJoinNode:
 		if n.remoteLookupExpr != nil || n.remoteOnlyLookups {
 			// This is a locality optimized join.
-			return cannotDistribute, nil
+			return cannotDistribute, localityOptimizedOpNotDistributableErr
 		}
 		if n.table.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
 			// Lookup joins that are performing row-level locking cannot
@@ -630,7 +668,7 @@ func checkSupportForPlanNode(
 		if err := checkExprForDistSQL(n.onCond, distSQLVisitor); err != nil {
 			return cannotDistribute, err
 		}
-		rec, err := checkSupportForPlanNode(n.input, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
@@ -639,7 +677,7 @@ func checkSupportForPlanNode(
 	case *ordinalityNode:
 		// WITH ORDINALITY never gets distributed so that the gateway node can
 		// always number each row in order.
-		return cannotDistribute, nil
+		return cannotDistribute, ordinalityNotDistributableErr
 
 	case *projectSetNode:
 		for i := range n.exprs {
@@ -647,7 +685,7 @@ func checkSupportForPlanNode(
 				return cannotDistribute, err
 			}
 		}
-		return checkSupportForPlanNode(n.source, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *renderNode:
 		for _, e := range n.render {
@@ -655,7 +693,7 @@ func checkSupportForPlanNode(
 				return cannotDistribute, err
 			}
 		}
-		return checkSupportForPlanNode(n.source.plan, distSQLVisitor)
+		return checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 
 	case *scanNode:
 		if n.lockingStrength != descpb.ScanLockingStrength_FOR_NONE {
@@ -666,47 +704,68 @@ func checkSupportForPlanNode(
 			return cannotDistribute, cannotDistributeRowLevelLockingErr
 		}
 
-		switch {
-		case n.localityOptimized:
+		if n.localityOptimized {
 			// This is a locality optimized scan.
-			return cannotDistribute, nil
-		case n.isFull:
-			// This is a full scan.
-			return shouldDistribute, nil
-		default:
-			// Although we don't yet recommend distributing plans where soft limits
-			// propagate to scan nodes because we don't have infrastructure to only
-			// plan for a few ranges at a time, the propagation of the soft limits
-			// to scan nodes has been added in 20.1 release, so to keep the
-			// previous behavior we continue to ignore the soft limits for now.
-			// TODO(yuzefovich): pay attention to the soft limits.
-			return canDistribute, nil
+			return cannotDistribute, localityOptimizedOpNotDistributableErr
 		}
+		// TODO(yuzefovich): consider using the soft limit in making a decision
+		// here.
+		scanRec := canDistribute
+		if n.estimatedRowCount != 0 && n.estimatedRowCount >= sd.DistributeScanRowCountThreshold {
+			log.VEventf(ctx, 2, "large scan recommends plan distribution")
+			scanRec = shouldDistribute
+		}
+		if n.isFull && (n.estimatedRowCount == 0 || sd.AlwaysDistributeFullScans) {
+			// In the absence of table stats, we default to always distributing
+			// full scans.
+			log.VEventf(ctx, 2, "full scan recommends plan distribution")
+			scanRec = shouldDistribute
+		}
+		return scanRec, nil
 
 	case *sortNode:
-		rec, err := checkSupportForPlanNode(n.plan, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		return rec.compose(shouldDistribute), nil
+		// Don't force distribution if we expect to process small number of
+		// rows.
+		sortRec := canDistribute
+		if n.estimatedInputRowCount == 0 {
+			log.VEventf(ctx, 2, "sort (no stats) recommends plan distribution")
+			sortRec = shouldDistribute
+		} else if n.estimatedInputRowCount >= sd.DistributeSortRowCountThreshold {
+			log.VEventf(ctx, 2, "large sort recommends plan distribution")
+			sortRec = shouldDistribute
+		}
+		return rec.compose(sortRec), nil
 
 	case *topKNode:
-		rec, err := checkSupportForPlanNode(n.plan, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		// If we have a top K sort, we can distribute the query.
-		return rec.compose(canDistribute), nil
+		// Don't force distribution if we expect to process small number of
+		// rows.
+		topKRec := canDistribute
+		if n.estimatedInputRowCount == 0 {
+			log.VEventf(ctx, 2, "top k (no stats) recommends plan distribution")
+			topKRec = shouldDistribute
+		} else if n.estimatedInputRowCount >= sd.DistributeSortRowCountThreshold {
+			log.VEventf(ctx, 2, "large top k recommends plan distribution")
+			topKRec = shouldDistribute
+		}
+		return rec.compose(topKRec), nil
 
 	case *unaryNode:
 		return canDistribute, nil
 
 	case *unionNode:
-		recLeft, err := checkSupportForPlanNode(n.left, distSQLVisitor)
+		recLeft, err := checkSupportForPlanNode(ctx, n.left, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
-		recRight, err := checkSupportForPlanNode(n.right, distSQLVisitor)
+		recRight, err := checkSupportForPlanNode(ctx, n.right, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
@@ -730,7 +789,7 @@ func checkSupportForPlanNode(
 		return canDistribute, nil
 
 	case *windowNode:
-		rec, err := checkSupportForPlanNode(n.plan, distSQLVisitor)
+		rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 		if err != nil {
 			return cannotDistribute, err
 		}
@@ -738,6 +797,9 @@ func checkSupportForPlanNode(
 			if len(f.partitionIdxs) > 0 {
 				// If at least one function has PARTITION BY clause, then we
 				// should distribute the execution.
+				// TODO(yuzefovich): we might want to be smarter about this and
+				// don't force distribution with small inputs.
+				log.VEventf(ctx, 2, "window function with PARTITION BY recommends plan distribution")
 				return rec.compose(shouldDistribute), nil
 			}
 		}
@@ -759,9 +821,10 @@ func checkSupportForPlanNode(
 		if err := checkExprForDistSQL(n.onCond, distSQLVisitor); err != nil {
 			return cannotDistribute, err
 		}
+		// TODO(yuzefovich): we might want to be smarter about this and don't
+		// force distribution with small inputs.
+		log.VEventf(ctx, 2, "zigzag join recommends plan distribution")
 		return shouldDistribute, nil
-	case *cdcValuesNode:
-		return cannotDistribute, nil
 
 	default:
 		return cannotDistribute, planNodeNotSupportedErr
@@ -769,9 +832,12 @@ func checkSupportForPlanNode(
 }
 
 func checkSupportForInvertedFilterNode(
-	n *invertedFilterNode, distSQLVisitor *distSQLExprCheckVisitor,
+	ctx context.Context,
+	n *invertedFilterNode,
+	distSQLVisitor *distSQLExprCheckVisitor,
+	sd *sessiondata.SessionData,
 ) (distRecommendation, error) {
-	rec, err := checkSupportForPlanNode(n.input, distSQLVisitor)
+	rec, err := checkSupportForPlanNode(ctx, n.input, distSQLVisitor, sd)
 	if err != nil {
 		return cannotDistribute, err
 	}
@@ -794,11 +860,13 @@ func checkSupportForInvertedFilterNode(
 	// the inverted column as the original type (e.g. for geospatial, tries to
 	// decode the int cell-id as a geometry) which obviously fails -- this is
 	// related to #50659. Fix this in the distSQLSpecExecFactory.
-	filterRec := cannotDistribute
-	if n.expression.Left == nil && n.expression.Right == nil {
-		filterRec = shouldDistribute
+	if n.expression.Left != nil || n.expression.Right != nil {
+		return cannotDistribute, invertedFilterNotDistributableErr
 	}
-	return rec.compose(filterRec), nil
+	// TODO(yuzefovich): we might want to be smarter about this and don't force
+	// distribution with small inputs.
+	log.VEventf(ctx, 2, "inverted filter (union of inverted spans) recommends plan distribution")
+	return rec.compose(shouldDistribute), nil
 }
 
 //go:generate stringer -type=NodeStatus
@@ -2507,7 +2575,7 @@ func (dsp *DistSQLPlanner) addAggregators(
 		isScalar:             n.isScalar,
 		groupCols:            n.groupCols,
 		groupColOrdering:     n.groupColOrdering,
-		inputMergeOrdering:   dsp.convertOrdering(planReqOrdering(n.plan), p.PlanToStreamColMap),
+		inputMergeOrdering:   dsp.convertOrdering(planReqOrdering(n.input), p.PlanToStreamColMap),
 		reqOrdering:          n.reqOrdering,
 		estimatedRowCount:    n.estimatedRowCount,
 	})
@@ -3721,11 +3789,11 @@ func getTypesForPlanResult(node planNode, planToStreamColMap []int) ([]*types.T,
 func (dsp *DistSQLPlanner) createPlanForJoin(
 	ctx context.Context, planCtx *PlanningCtx, n *joinNode,
 ) (*PhysicalPlan, error) {
-	leftPlan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.left.plan)
+	leftPlan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.left)
 	if err != nil {
 		return nil, err
 	}
-	rightPlan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.right.plan)
+	rightPlan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.right)
 	if err != nil {
 		return nil, err
 	}
@@ -3818,12 +3886,13 @@ func (dsp *DistSQLPlanner) planJoiners(
 		// single processor.
 		sqlInstances = []base.SQLInstanceID{dsp.gatewaySQLInstanceID}
 
-		// If either side has a single stream, put the processor on that node. We
-		// prefer the left side because that is processed first by the hash joiner.
-		if len(leftRouters) == 1 {
-			sqlInstances[0] = p.Processors[leftRouters[0]].SQLInstanceID
-		} else if len(rightRouters) == 1 {
+		// If either side has a single stream, put the processor on that node.
+		// We prefer the right side because that is processed first by the hash
+		// joiner.
+		if len(rightRouters) == 1 {
 			sqlInstances[0] = p.Processors[rightRouters[0]].SQLInstanceID
+		} else if len(leftRouters) == 1 {
+			sqlInstances[0] = p.Processors[leftRouters[0]].SQLInstanceID
 		}
 	}
 
@@ -3894,7 +3963,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		plan, err = dsp.createPlanForExport(ctx, planCtx, n)
 
 	case *filterNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -3904,7 +3973,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		}
 
 	case *groupNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -3933,7 +4002,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		plan, err = dsp.createPlanForJoin(ctx, planCtx, n)
 
 	case *limitNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -3955,7 +4024,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		plan, err = dsp.createPlanForProjectSet(ctx, planCtx, n)
 
 	case *renderNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -3967,9 +4036,9 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 	case *rowCountNode:
 		if in, ok := n.source.(*insertNode); ok {
 			// Skip over any renderNodes.
-			nod := in.source
-			for r, ok := nod.(*renderNode); ok; r, ok = r.source.plan.(*renderNode) {
-				nod = r.source.plan
+			nod := in.input
+			for r, ok := nod.(*renderNode); ok; r, ok = r.input.(*renderNode) {
+				nod = r.input
 			}
 			if v, ok := nod.(*valuesNode); ok {
 				if v.coldataBatch != nil {
@@ -3988,7 +4057,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		plan, err = dsp.createTableReaders(ctx, planCtx, n)
 
 	case *sortNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -3996,7 +4065,7 @@ func (dsp *DistSQLPlanner) createPhysPlanForPlanNode(
 		dsp.addSorters(ctx, plan, n.ordering, n.alreadyOrderedPrefix, 0 /* limit */)
 
 	case *topKNode:
-		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+		plan, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 		if err != nil {
 			return nil, err
 		}
@@ -4079,26 +4148,27 @@ func (dsp *DistSQLPlanner) wrapPlan(
 	// DistSQL-enabled planNode in the tree. If we find one, we ask the planner to
 	// continue the DistSQL planning recursion on that planNode.
 	seenTop := false
-	nParents := uint32(0)
-	p := planCtx.NewPhysicalPlan()
-	// This will be set to first DistSQL-enabled planNode we find, if any. We'll
-	// modify its parent later to connect its source to the DistSQL-planned
-	// subtree.
-	var firstNotWrapped planNode
-	if err := walkPlan(ctx, n, planObserver{
-		enterNode: func(ctx context.Context, nodeName string, plan planNode) (bool, error) {
-			switch plan.(type) {
-			case *explainVecNode, *explainPlanNode, *explainDDLNode:
-				// Don't continue recursing into explain nodes - they need to be left
-				// alone since they handle their own planning later.
-				return false, nil
+	var planFirstDistSQLNode func(plan planNode) (planNode, *PhysicalPlan, error)
+	planFirstDistSQLNode = func(plan planNode) (planNode, *PhysicalPlan, error) {
+		switch plan.(type) {
+		case *explainVecNode, *explainPlanNode, *explainDDLNode:
+			// Don't continue recursing into explain nodes - they need to be left
+			// alone since they handle their own planning later.
+			return nil, nil, nil
+		}
+		if !seenTop {
+			seenTop = true
+		} else if !dsp.mustWrapNode(planCtx, plan) || shouldWrapPlanNodeForExecStats(planCtx, plan) {
+			p, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, plan)
+			if err != nil {
+				return nil, nil, err
 			}
-			if !seenTop {
-				// We know we're wrapping the first node, so ignore it.
-				seenTop = true
-				return true, nil
-			}
-			var err error
+			return plan, p, nil
+		}
+		switch plan.InputCount() {
+		case 0:
+			return nil, nil, nil
+		case 1:
 			// Continue walking until we find a node that has a DistSQL
 			// representation - that's when we'll quit the wrapping process and
 			// hand control of planning back to the DistSQL physical planner.
@@ -4108,22 +4178,22 @@ func (dsp *DistSQLPlanner) wrapPlan(
 			// rowSourceToPlanNode adapters so that the execution statistics
 			// are collected for each planNode independently. This should have
 			// low enough overhead.
-			if !dsp.mustWrapNode(planCtx, plan) || shouldWrapPlanNodeForExecStats(planCtx, plan) {
-				firstNotWrapped = plan
-				p, err = dsp.createPhysPlanForPlanNode(ctx, planCtx, plan)
-				if err != nil {
-					return false, err
-				}
-				nParents++
-				return false, nil
+			input, err := plan.Input(0)
+			if err != nil {
+				return nil, nil, err
 			}
-			return true, nil
-		},
-	}); err != nil {
+			return planFirstDistSQLNode(input)
+		default:
+			// Can't wrap plans with more than 1 input.
+			return nil, nil, nil
+		}
+	}
+	firstNotWrapped, p, err := planFirstDistSQLNode(n)
+	if err != nil {
 		return nil, err
 	}
-	if nParents > 1 {
-		return nil, errors.Errorf("can't wrap plan %v %T with more than one input", n, n)
+	if p == nil {
+		p = planCtx.NewPhysicalPlan()
 	}
 
 	// Copy the evalCtx.
@@ -4159,7 +4229,7 @@ func (dsp *DistSQLPlanner) wrapPlan(
 			Input: input,
 			Core: execinfrapb.ProcessorCoreUnion{LocalPlanNode: &execinfrapb.LocalPlanNodeSpec{
 				RowSourceIdx: uint32(localProcIdx),
-				NumInputs:    nParents,
+				NumInputs:    uint32(len(input)),
 				Name:         name,
 			}},
 			Post: execinfrapb.PostProcessSpec{},
@@ -4315,7 +4385,7 @@ func (dsp *DistSQLPlanner) createDistinctSpec(
 func (dsp *DistSQLPlanner) createPlanForDistinct(
 	ctx context.Context, planCtx *PlanningCtx, n *distinctNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}
@@ -4355,7 +4425,7 @@ func (dsp *DistSQLPlanner) addDistinctProcessors(
 func (dsp *DistSQLPlanner) createPlanForOrdinality(
 	ctx context.Context, planCtx *PlanningCtx, n *ordinalityNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}
@@ -4406,7 +4476,7 @@ func createProjectSetSpec(
 func (dsp *DistSQLPlanner) createPlanForProjectSet(
 	ctx context.Context, planCtx *PlanningCtx, n *projectSetNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}
@@ -4748,7 +4818,7 @@ func (dsp *DistSQLPlanner) createPlanForSetOp(
 func (dsp *DistSQLPlanner) createPlanForWindow(
 	ctx context.Context, planCtx *PlanningCtx, n *windowNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.plan)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}
@@ -4892,7 +4962,7 @@ func (dsp *DistSQLPlanner) createPlanForWindow(
 func (dsp *DistSQLPlanner) createPlanForExport(
 	ctx context.Context, planCtx *PlanningCtx, n *exportNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}
@@ -5270,7 +5340,7 @@ func (dsp *DistSQLPlanner) createPlanForRowCount(
 func (dsp *DistSQLPlanner) createPlanForInsert(
 	ctx context.Context, planCtx *PlanningCtx, n *insertNode,
 ) (*PhysicalPlan, error) {
-	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.source)
+	plan, err := dsp.createPhysPlanForPlanNode(ctx, planCtx, n.input)
 	if err != nil {
 		return nil, err
 	}

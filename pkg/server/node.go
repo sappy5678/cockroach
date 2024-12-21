@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"sort"
@@ -1872,6 +1873,38 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 	return br, nil
 }
 
+// BatchStream implements the kvpb.InternalServer interface.
+func (n *Node) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
+	ctx := stream.Context()
+	for {
+		argsAlloc := new(struct {
+			args kvpb.BatchRequest
+			reqs [1]kvpb.RequestUnion
+		})
+		args := &argsAlloc.args
+		args.Requests = argsAlloc.reqs[:0]
+
+		err := stream.RecvMsg(args)
+		if err != nil {
+			// From grpc.ServerStream.Recv:
+			// > It returns io.EOF when the client has performed a CloseSend.
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+
+		br, err := n.Batch(ctx, args)
+		if err != nil {
+			return err
+		}
+		err = stream.Send(br)
+		if err != nil {
+			return err
+		}
+	}
+}
+
 // spanForRequest is the retval of setupSpanForIncomingRPC. It groups together a
 // few variables needed when finishing an RPC's span.
 //
@@ -1965,7 +1998,9 @@ func setupSpanForIncomingRPC(
 			tracing.WithServerSpanKind)
 	}
 
-	newSpan.SetLazyTag("request", ba.ShallowCopy())
+	if newSpan != nil && !newSpan.IsNoop() {
+		newSpan.SetLazyTag("request", ba.ShallowCopy())
+	}
 	return ctx, spanForRequest{
 		// For non-local requests, we'll need to attach the recording to the
 		// outgoing BatchResponse if the request is traced. We ignore whether the

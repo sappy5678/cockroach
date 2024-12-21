@@ -30,6 +30,7 @@ variable                                                   value
 allow_ordinal_column_references                            off
 allow_role_memberships_to_change_during_transaction        off
 alter_primary_region_super_region_override                 off
+always_distribute_full_scans                               off
 application_name                                           ·
 authentication_method                                      cert-password
 autocommit_before_ddl                                      off
@@ -68,6 +69,10 @@ disable_partially_distributed_plans                        off
 disable_plan_gists                                         off
 disable_vec_union_eager_cancellation                       off
 disallow_full_table_scans                                  off
+distribute_group_by_row_count_threshold                    1000
+distribute_join_row_count_threshold                        1000
+distribute_scan_row_count_threshold                        10000
+distribute_sort_row_count_threshold                        1000
 distsql                                                    off
 distsql_plan_gateway_bias                                  2
 enable_auto_rehoming                                       off
@@ -115,6 +120,7 @@ lc_messages                                                C.UTF-8
 lc_monetary                                                C.UTF-8
 lc_numeric                                                 C.UTF-8
 lc_time                                                    C.UTF-8
+legacy_varchar_typing                                      off
 locality                                                   region=test,dc=dc1
 locality_optimized_partitioned_index_scan                  on
 lock_timeout                                               0
@@ -122,6 +128,7 @@ log_timezone                                               UTC
 max_connections                                            -1
 max_identifier_length                                      128
 max_index_keys                                             32
+max_prepared_transactions                                  2147483647
 max_retries_for_read_committed                             10
 node_id                                                    1
 null_ordered_last                                          off
@@ -463,7 +470,7 @@ query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM CURRENT_CATALOG WITH DETAILS]
 ----
 start_key  end_key  replicas  lease_holder
-/Table/71  /Max     {1}       1
+/Table/72  /Max     {1}       1
 
 query TTTI colnames
 SELECT start_key, end_key, replicas, lease_holder FROM [SHOW RANGES FROM TABLE system.descriptor WITH DETAILS]

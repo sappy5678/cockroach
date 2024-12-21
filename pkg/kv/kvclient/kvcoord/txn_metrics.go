@@ -21,6 +21,7 @@ type TxnMetrics struct {
 	ParallelCommits           *metric.Counter // Commits which entered the STAGING state
 	ParallelCommitAutoRetries *metric.Counter // Commits which were retried after entering the STAGING state
 	CommitWaits               *metric.Counter // Commits that waited for linearizability
+	Prepares                  *metric.Counter
 
 	ClientRefreshSuccess                *metric.Counter
 	ClientRefreshFail                   *metric.Counter
@@ -34,6 +35,8 @@ type TxnMetrics struct {
 	TxnsWithCondensedIntents            *metric.Counter
 	TxnsWithCondensedIntentsGauge       *metric.Gauge
 	TxnsRejectedByLockSpanBudget        *metric.Counter
+	TxnsRejectedByCountLimit            *metric.Counter
+	TxnsResponseOverCountLimit          *metric.Counter
 	TxnsInFlightLocksOverTrackingBudget *metric.Counter
 
 	// Restarts is the number of times we had to restart the transaction.
@@ -96,6 +99,12 @@ var (
 		Help: "Number of KV transactions that had to commit-wait on commit " +
 			"in order to ensure linearizability. This generally happens to " +
 			"transactions writing to global ranges.",
+		Measurement: "KV Transactions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaPreparesRates = metric.Metadata{
+		Name:        "txn.prepares",
+		Help:        "Number of prepared KV transactions",
 		Measurement: "KV Transactions",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -171,6 +180,18 @@ var (
 		Help: "KV transactions that have been aborted because they exceeded their intent tracking " +
 			"memory budget (kv.transaction.max_intents_bytes). " +
 			"Rejection is caused by kv.transaction.reject_over_max_intents_budget.",
+		Measurement: "KV Transactions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaTxnsRejectedByCountLimit = metric.Metadata{
+		Name:        "txn.count_limit_rejected",
+		Help:        "KV transactions that have been aborted because they exceeded the max number of writes and locking reads allowed",
+		Measurement: "KV Transactions",
+		Unit:        metric.Unit_COUNT,
+	}
+	metaTxnsResponseOverCountLimit = metric.Metadata{
+		Name:        "txn.count_limit_on_response",
+		Help:        "KV transactions that have exceeded the count limit on a response",
 		Measurement: "KV Transactions",
 		Unit:        metric.Unit_COUNT,
 	}
@@ -274,6 +295,7 @@ func MakeTxnMetrics(histogramWindow time.Duration) TxnMetrics {
 		ParallelCommits:                     metric.NewCounter(metaParallelCommitsRates),
 		ParallelCommitAutoRetries:           metric.NewCounter(metaParallelCommitAutoRetries),
 		CommitWaits:                         metric.NewCounter(metaCommitWaitCount),
+		Prepares:                            metric.NewCounter(metaPreparesRates),
 		ClientRefreshSuccess:                metric.NewCounter(metaClientRefreshSuccess),
 		ClientRefreshFail:                   metric.NewCounter(metaClientRefreshFail),
 		ClientRefreshFailWithCondensedSpans: metric.NewCounter(metaClientRefreshFailWithCondensedSpans),
@@ -289,6 +311,8 @@ func MakeTxnMetrics(histogramWindow time.Duration) TxnMetrics {
 		TxnsWithCondensedIntents:            metric.NewCounter(metaTxnsWithCondensedIntentSpans),
 		TxnsWithCondensedIntentsGauge:       metric.NewGauge(metaTxnsWithCondensedIntentSpansGauge),
 		TxnsRejectedByLockSpanBudget:        metric.NewCounter(metaTxnsRejectedByLockSpanBudget),
+		TxnsRejectedByCountLimit:            metric.NewCounter(metaTxnsRejectedByCountLimit),
+		TxnsResponseOverCountLimit:          metric.NewCounter(metaTxnsResponseOverCountLimit),
 		TxnsInFlightLocksOverTrackingBudget: metric.NewCounter(metaTxnsInflightLocksOverTrackingBudget),
 		Restarts: metric.NewHistogram(metric.HistogramOptions{
 			Metadata:     metaRestartsHistogram,

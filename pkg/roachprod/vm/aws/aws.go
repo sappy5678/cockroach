@@ -79,14 +79,32 @@ func Init() error {
 	// NB: This is a bit hacky, but using something like `aws iam get-user` is
 	// slow and not something we want to do at startup.
 	haveCredentials := func() bool {
+		// We assume SSO is enabled if either AWS_PROFILE is set or ~/.aws/config exists.
+		// N.B. We can't check if the user explicitly passed `--aws-profile` because CLI parsing hasn't happened yet.
+		if os.Getenv("AWS_PROFILE") != "" {
+			return true
+		}
+		const configFile = "${HOME}/.aws/config"
+		if _, err := os.Stat(os.ExpandEnv(configFile)); err == nil {
+			return true
+		}
+		// Non-SSO authentication is deprecated and will be removed in the future. However, CI continues to use it.
+		hasAuth := false
 		const credFile = "${HOME}/.aws/credentials"
 		if _, err := os.Stat(os.ExpandEnv(credFile)); err == nil {
-			return true
+			hasAuth = true
 		}
 		if os.Getenv("AWS_ACCESS_KEY_ID") != "" {
-			return true
+			hasAuth = true
 		}
-		return false
+		if !hasAuth {
+			// No known method of auth. was detected.
+			return false
+		}
+		// Non-SSO auth. is deprecated, so let's display a warning.
+		fmt.Fprintf(os.Stderr, "WARN: Non-SSO form of authentication is deprecated and will be removed in the future.\n")
+		fmt.Fprintf(os.Stderr, "WARN:\tPlease set `AWS_PROFILE` or pass `--aws-profile`.\n")
+		return true
 	}
 	if !haveCredentials() {
 		vm.Providers[ProviderName] = flagstub.New(&Provider{}, noCredentials)
@@ -496,7 +514,7 @@ func (o *ProviderOpts) ConfigureCreateFlags(flags *pflag.FlagSet) {
 
 // ConfigureClusterFlags implements vm.ProviderOpts.
 func (o *ProviderOpts) ConfigureClusterFlags(flags *pflag.FlagSet, _ vm.MultipleProjectsOption) {
-	flags.StringVar(&providerInstance.Profile, ProviderName+"-profile", providerInstance.Profile,
+	flags.StringVar(&providerInstance.Profile, ProviderName+"-profile", os.Getenv("AWS_PROFILE"),
 		"Profile to manage cluster in")
 	configFlagVal := awsConfigValue{awsConfig: *DefaultConfig}
 	providerInstance.Config = &configFlagVal.awsConfig

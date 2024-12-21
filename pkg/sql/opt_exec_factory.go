@@ -207,30 +207,22 @@ func (ef *execFactory) constructVirtualScan(
 	)
 }
 
-func asDataSource(n exec.Node) planDataSource {
-	plan := n.(planNode)
-	return planDataSource{
-		columns: planColumns(plan),
-		plan:    plan,
-	}
-}
-
 // ConstructFilter is part of the exec.Factory interface.
 func (ef *execFactory) ConstructFilter(
 	n exec.Node, filter tree.TypedExpr, reqOrdering exec.OutputOrdering,
 ) (exec.Node, error) {
-	// Create a filterNode.
-	src := asDataSource(n)
+	p := n.(planNode)
 	f := &filterNode{
-		source: src,
+		singleInputPlanNode: singleInputPlanNode{p},
+		columns:             planColumns(p),
 	}
 	f.filter = filter
 	f.reqOrdering = ReqOrdering(reqOrdering)
 
 	// If there's a spool, pull it up.
-	if spool, ok := f.source.plan.(*spoolNode); ok {
-		f.source.plan = spool.source
-		spool.source = f
+	if spool, ok := f.input.(*spoolNode); ok {
+		f.input = spool.input
+		spool.input = f
 		return spool, nil
 	}
 	return f, nil
@@ -248,12 +240,12 @@ func (ef *execFactory) ConstructInvertedFilter(
 	columns := make(colinfo.ResultColumns, len(inputCols))
 	copy(columns, inputCols)
 	n = &invertedFilterNode{
-		input:           n.(planNode),
-		expression:      invFilter,
-		preFiltererExpr: preFiltererExpr,
-		preFiltererType: preFiltererType,
-		invColumn:       int(invColumn),
-		resultColumns:   columns,
+		singleInputPlanNode: singleInputPlanNode{n.(planNode)},
+		expression:          invFilter,
+		preFiltererExpr:     preFiltererExpr,
+		preFiltererType:     preFiltererType,
+		invColumn:           int(invColumn),
+		resultColumns:       columns,
 	}
 	return n, nil
 }
@@ -415,11 +407,14 @@ func (ef *execFactory) ConstructHashJoin(
 	leftEqCols, rightEqCols []exec.NodeColumnOrdinal,
 	leftEqColsAreKey, rightEqColsAreKey bool,
 	extraOnCond tree.TypedExpr,
+	estimatedLeftRowCount, estimatedRightRowCount uint64,
 ) (exec.Node, error) {
 	p := ef.planner
-	leftSrc := asDataSource(left)
-	rightSrc := asDataSource(right)
-	pred := makePredicate(joinType, leftSrc.columns, rightSrc.columns, extraOnCond)
+	leftPlan := left.(planNode)
+	rightPlan := right.(planNode)
+	leftCols := planColumns(leftPlan)
+	rightCols := planColumns(rightPlan)
+	pred := makePredicate(joinType, leftCols, rightCols, extraOnCond)
 
 	numEqCols := len(leftEqCols)
 	pred.leftEqualityIndices = leftEqCols
@@ -429,13 +424,13 @@ func (ef *execFactory) ConstructHashJoin(
 	pred.rightColNames = nameBuf[numEqCols:]
 
 	for i := range leftEqCols {
-		pred.leftColNames[i] = tree.Name(leftSrc.columns[leftEqCols[i]].Name)
-		pred.rightColNames[i] = tree.Name(rightSrc.columns[rightEqCols[i]].Name)
+		pred.leftColNames[i] = tree.Name(leftCols[leftEqCols[i]].Name)
+		pred.rightColNames[i] = tree.Name(rightCols[rightEqCols[i]].Name)
 	}
 	pred.leftEqKey = leftEqColsAreKey
 	pred.rightEqKey = rightEqColsAreKey
 
-	return p.makeJoinNode(leftSrc, rightSrc, pred), nil
+	return p.makeJoinNode(leftPlan, rightPlan, pred, estimatedLeftRowCount, estimatedRightRowCount), nil
 }
 
 // ConstructApplyJoin is part of the exec.Factory interface.
@@ -446,9 +441,10 @@ func (ef *execFactory) ConstructApplyJoin(
 	onCond tree.TypedExpr,
 	planRightSideFn exec.ApplyJoinPlanRightSideFn,
 ) (exec.Node, error) {
-	leftSrc := asDataSource(left)
-	pred := makePredicate(joinType, leftSrc.columns, rightColumns, onCond)
-	return newApplyJoinNode(joinType, leftSrc, rightColumns, pred, planRightSideFn)
+	l := left.(planNode)
+	leftCols := planColumns(l)
+	pred := makePredicate(joinType, leftCols, rightColumns, onCond)
+	return newApplyJoinNode(joinType, l, rightColumns, pred, planRightSideFn)
 }
 
 // ConstructMergeJoin is part of the exec.Factory interface.
@@ -459,13 +455,16 @@ func (ef *execFactory) ConstructMergeJoin(
 	leftOrdering, rightOrdering colinfo.ColumnOrdering,
 	reqOrdering exec.OutputOrdering,
 	leftEqColsAreKey, rightEqColsAreKey bool,
+	estimatedLeftRowCount, estimatedRightRowCount uint64,
 ) (exec.Node, error) {
 	var err error
 	p := ef.planner
-	leftSrc := asDataSource(left)
-	rightSrc := asDataSource(right)
-	pred := makePredicate(joinType, leftSrc.columns, rightSrc.columns, onCond)
-	node := p.makeJoinNode(leftSrc, rightSrc, pred)
+	leftPlan := left.(planNode)
+	rightPlan := right.(planNode)
+	leftCols := planColumns(leftPlan)
+	rightCols := planColumns(rightPlan)
+	pred := makePredicate(joinType, leftCols, rightCols, onCond)
+	node := p.makeJoinNode(leftPlan, rightPlan, pred, estimatedLeftRowCount, estimatedRightRowCount)
 	pred.leftEqKey = leftEqColsAreKey
 	pred.rightEqKey = rightEqColsAreKey
 
@@ -478,8 +477,8 @@ func (ef *execFactory) ConstructMergeJoin(
 	pred.rightColNames = make(tree.NameList, n)
 	for i := 0; i < n; i++ {
 		leftColIdx, rightColIdx := leftOrdering[i].ColIdx, rightOrdering[i].ColIdx
-		pred.leftColNames[i] = tree.Name(leftSrc.columns[leftColIdx].Name)
-		pred.rightColNames[i] = tree.Name(rightSrc.columns[rightColIdx].Name)
+		pred.leftColNames[i] = tree.Name(leftCols[leftColIdx].Name)
+		pred.rightColNames[i] = tree.Name(rightCols[rightColIdx].Name)
 	}
 
 	// Set up node.props, which tells the distsql planner to maintain the
@@ -491,7 +490,7 @@ func (ef *execFactory) ConstructMergeJoin(
 
 // ConstructScalarGroupBy is part of the exec.Factory interface.
 func (ef *execFactory) ConstructScalarGroupBy(
-	input exec.Node, aggregations []exec.AggInfo,
+	input exec.Node, aggregations []exec.AggInfo, estimatedInputRowCount uint64,
 ) (exec.Node, error) {
 	// There are no grouping columns with scalar GroupBy, so we create empty
 	// arguments upfront to be passed into getResultColumnsForGroupBy call
@@ -499,10 +498,12 @@ func (ef *execFactory) ConstructScalarGroupBy(
 	var inputCols colinfo.ResultColumns
 	var groupCols []exec.NodeColumnOrdinal
 	n := &groupNode{
-		plan:     input.(planNode),
-		funcs:    make([]*aggregateFuncHolder, 0, len(aggregations)),
-		columns:  getResultColumnsForGroupBy(inputCols, groupCols, aggregations),
-		isScalar: true,
+		singleInputPlanNode:    singleInputPlanNode{input.(planNode)},
+		funcs:                  make([]*aggregateFuncHolder, 0, len(aggregations)),
+		columns:                getResultColumnsForGroupBy(inputCols, groupCols, aggregations),
+		isScalar:               true,
+		estimatedRowCount:      1,
+		estimatedInputRowCount: estimatedInputRowCount,
 	}
 	if err := ef.addAggregations(n, aggregations); err != nil {
 		return nil, err
@@ -519,20 +520,22 @@ func (ef *execFactory) ConstructGroupBy(
 	reqOrdering exec.OutputOrdering,
 	groupingOrderType exec.GroupingOrderType,
 	estimatedRowCount uint64,
+	estimatedInputRowCount uint64,
 ) (exec.Node, error) {
 	inputPlan := input.(planNode)
 	inputCols := planColumns(inputPlan)
 	// TODO(harding): Use groupingOrder to determine when to use a hash
 	// aggregator.
 	n := &groupNode{
-		plan:              inputPlan,
-		funcs:             make([]*aggregateFuncHolder, 0, len(groupCols)+len(aggregations)),
-		columns:           getResultColumnsForGroupBy(inputCols, groupCols, aggregations),
-		groupCols:         groupCols,
-		groupColOrdering:  groupColOrdering,
-		isScalar:          false,
-		reqOrdering:       ReqOrdering(reqOrdering),
-		estimatedRowCount: estimatedRowCount,
+		singleInputPlanNode:    singleInputPlanNode{inputPlan},
+		funcs:                  make([]*aggregateFuncHolder, 0, len(groupCols)+len(aggregations)),
+		columns:                getResultColumnsForGroupBy(inputCols, groupCols, aggregations),
+		groupCols:              groupCols,
+		groupColOrdering:       groupColOrdering,
+		isScalar:               false,
+		reqOrdering:            ReqOrdering(reqOrdering),
+		estimatedRowCount:      estimatedRowCount,
+		estimatedInputRowCount: estimatedInputRowCount,
 	}
 	for _, col := range n.groupCols {
 		// TODO(radu): only generate the grouping columns we actually need.
@@ -578,12 +581,12 @@ func (ef *execFactory) ConstructDistinct(
 	errorOnDup string,
 ) (exec.Node, error) {
 	return &distinctNode{
-		plan:              input.(planNode),
-		distinctOnColIdxs: distinctCols,
-		columnsInOrder:    orderedCols,
-		reqOrdering:       ReqOrdering(reqOrdering),
-		nullsAreDistinct:  nullsAreDistinct,
-		errorOnDup:        errorOnDup,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		distinctOnColIdxs:   distinctCols,
+		columnsInOrder:      orderedCols,
+		reqOrdering:         ReqOrdering(reqOrdering),
+		nullsAreDistinct:    nullsAreDistinct,
+		errorOnDup:          errorOnDup,
 	}, nil
 }
 
@@ -635,12 +638,16 @@ func (ef *execFactory) ConstructUnionAll(
 
 // ConstructSort is part of the exec.Factory interface.
 func (ef *execFactory) ConstructSort(
-	input exec.Node, ordering exec.OutputOrdering, alreadyOrderedPrefix int,
+	input exec.Node,
+	ordering exec.OutputOrdering,
+	alreadyOrderedPrefix int,
+	estimatedInputRowCount uint64,
 ) (exec.Node, error) {
 	return &sortNode{
-		plan:                 input.(planNode),
-		ordering:             colinfo.ColumnOrdering(ordering),
-		alreadyOrderedPrefix: alreadyOrderedPrefix,
+		singleInputPlanNode:    singleInputPlanNode{input.(planNode)},
+		ordering:               colinfo.ColumnOrdering(ordering),
+		alreadyOrderedPrefix:   alreadyOrderedPrefix,
+		estimatedInputRowCount: estimatedInputRowCount,
 	}, nil
 }
 
@@ -655,8 +662,8 @@ func (ef *execFactory) ConstructOrdinality(input exec.Node, colName string) (exe
 		Typ:  types.Int,
 	}
 	return &ordinalityNode{
-		source:  plan,
-		columns: cols,
+		singleInputPlanNode: singleInputPlanNode{plan},
+		columns:             cols,
 	}, nil
 }
 
@@ -696,12 +703,12 @@ func (ef *execFactory) ConstructIndexJoin(
 	}
 
 	n := &indexJoinNode{
-		input:         input.(planNode),
-		table:         tableScan,
-		cols:          cols,
-		resultColumns: colinfo.ResultColumnsFromColumns(tabDesc.GetID(), cols),
-		reqOrdering:   ReqOrdering(reqOrdering),
-		limitHint:     limitHint,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		table:               tableScan,
+		cols:                cols,
+		resultColumns:       colinfo.ResultColumnsFromColumns(tabDesc.GetID(), cols),
+		reqOrdering:         ReqOrdering(reqOrdering),
+		limitHint:           limitHint,
 	}
 
 	n.keyCols = make([]int, len(keyCols))
@@ -757,7 +764,7 @@ func (ef *execFactory) ConstructLookupJoin(
 	}
 
 	n := &lookupJoinNode{
-		input:                      input.(planNode),
+		singleInputPlanNode:        singleInputPlanNode{input.(planNode)},
 		table:                      tableScan,
 		joinType:                   joinType,
 		eqColsAreKey:               eqColsAreKey,
@@ -841,18 +848,18 @@ func (ef *execFactory) constructVirtualTableLookupJoin(
 	}
 	pred := makePredicate(joinType, inputCols, projectedVtableCols, onCond)
 	n := &vTableLookupJoinNode{
-		input:             input.(planNode),
-		joinType:          joinType,
-		virtualTableEntry: virtual,
-		dbName:            tn.Catalog(),
-		table:             tableDesc,
-		index:             idx,
-		eqCol:             int(eqCols[0]),
-		inputCols:         inputCols,
-		vtableCols:        vtableCols,
-		lookupCols:        lookupCols,
-		columns:           outputCols,
-		pred:              pred,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		joinType:            joinType,
+		virtualTableEntry:   virtual,
+		dbName:              tn.Catalog(),
+		table:               tableDesc,
+		index:               idx,
+		eqCol:               int(eqCols[0]),
+		inputCols:           inputCols,
+		vtableCols:          vtableCols,
+		lookupCols:          lookupCols,
+		columns:             outputCols,
+		pred:                pred,
 	}
 	return n, nil
 }
@@ -892,7 +899,7 @@ func (ef *execFactory) ConstructInvertedJoin(
 	}
 
 	n := &invertedJoinNode{
-		input:                     input.(planNode),
+		singleInputPlanNode:       singleInputPlanNode{input.(planNode)},
 		table:                     tableScan,
 		joinType:                  joinType,
 		invertedExpr:              invertedExpr,
@@ -1060,38 +1067,42 @@ func (ef *execFactory) ConstructLimit(
 		}
 	}
 	return &limitNode{
-		plan:       plan,
-		countExpr:  limit,
-		offsetExpr: offset,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		countExpr:           limit,
+		offsetExpr:          offset,
 	}, nil
 }
 
-// ConstructTopK is part of the execFactory interface.
+// ConstructTopK is part of the exec.Factory interface.
 func (ef *execFactory) ConstructTopK(
-	input exec.Node, k int64, ordering exec.OutputOrdering, alreadyOrderedPrefix int,
+	input exec.Node,
+	k int64,
+	ordering exec.OutputOrdering,
+	alreadyOrderedPrefix int,
+	estimatedInputRowCount uint64,
 ) (exec.Node, error) {
 	return &topKNode{
-		plan:                 input.(planNode),
-		k:                    k,
-		ordering:             colinfo.ColumnOrdering(ordering),
-		alreadyOrderedPrefix: alreadyOrderedPrefix,
+		singleInputPlanNode:    singleInputPlanNode{input.(planNode)},
+		k:                      k,
+		ordering:               colinfo.ColumnOrdering(ordering),
+		alreadyOrderedPrefix:   alreadyOrderedPrefix,
+		estimatedInputRowCount: estimatedInputRowCount,
 	}, nil
 }
 
 // ConstructMax1Row is part of the exec.Factory interface.
 func (ef *execFactory) ConstructMax1Row(input exec.Node, errorText string) (exec.Node, error) {
-	plan := input.(planNode)
 	return &max1RowNode{
-		plan:      plan,
-		errorText: errorText,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		errorText:           errorText,
 	}, nil
 }
 
 // ConstructBuffer is part of the exec.Factory interface.
 func (ef *execFactory) ConstructBuffer(input exec.Node, label string) (exec.Node, error) {
 	return &bufferNode{
-		plan:  input.(planNode),
-		label: label,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		label:               label,
 	}, nil
 }
 
@@ -1113,10 +1124,10 @@ func (ef *execFactory) ConstructRecursiveCTE(
 	initial exec.Node, fn exec.RecursiveCTEIterationFn, label string, deduplicate bool,
 ) (exec.Node, error) {
 	return &recursiveCTENode{
-		initial:        initial.(planNode),
-		genIterationFn: fn,
-		label:          label,
-		deduplicate:    deduplicate,
+		singleInputPlanNode: singleInputPlanNode{initial.(planNode)},
+		genIterationFn:      fn,
+		label:               label,
+		deduplicate:         deduplicate,
 	}, nil
 }
 
@@ -1124,13 +1135,14 @@ func (ef *execFactory) ConstructRecursiveCTE(
 func (ef *execFactory) ConstructProjectSet(
 	n exec.Node, exprs tree.TypedExprs, zipCols colinfo.ResultColumns, numColsPerGen []int,
 ) (exec.Node, error) {
-	src := asDataSource(n)
-	cols := append(src.columns, zipCols...)
+	p := n.(planNode)
+	cols := planColumns(p)
+	allCols := append(cols, zipCols...)
 	return &projectSetNode{
-		source: src.plan,
+		singleInputPlanNode: singleInputPlanNode{p},
 		projectSetPlanningInfo: projectSetPlanningInfo{
-			columns:         cols,
-			numColsInSource: len(src.columns),
+			columns:         allCols,
+			numColsInSource: len(cols),
 			exprs:           exprs,
 			numColsPerGen:   numColsPerGen,
 		},
@@ -1140,8 +1152,8 @@ func (ef *execFactory) ConstructProjectSet(
 // ConstructWindow is part of the exec.Factory interface.
 func (ef *execFactory) ConstructWindow(root exec.Node, wi exec.WindowInfo) (exec.Node, error) {
 	p := &windowNode{
-		plan:    root.(planNode),
-		columns: wi.Cols,
+		singleInputPlanNode: singleInputPlanNode{root.(planNode)},
+		columns:             wi.Cols,
 	}
 
 	partitionIdxs := make([]int, len(wi.Partition))
@@ -1190,7 +1202,7 @@ func (ef *execFactory) ConstructPlan(
 ) (exec.Plan, error) {
 	// No need to spool at the root.
 	if spool, ok := root.(*spoolNode); ok {
-		root = spool.source
+		root = spool.input
 	}
 	return constructPlan(ef.planner, root, subqueries, cascades, triggers, checks, rootRowCount, flags)
 }
@@ -1340,14 +1352,16 @@ func (ef *execFactory) ConstructShowTrace(typ tree.ShowTraceType, compact bool) 
 	// does not get confused.
 	ageColIdx := colinfo.GetTraceAgeColumnIdx(compact)
 	node = &sortNode{
-		plan: node,
+		singleInputPlanNode: singleInputPlanNode{node},
 		ordering: colinfo.ColumnOrdering{
 			colinfo.ColumnOrderInfo{ColIdx: ageColIdx, Direction: encoding.Ascending},
 		},
 	}
 
 	if typ == tree.ShowTraceReplica {
-		node = &showTraceReplicaNode{plan: node}
+		node = &showTraceReplicaNode{
+			singleInputPlanNode: singleInputPlanNode{node},
+		}
 	}
 	return node, nil
 }
@@ -1401,7 +1415,7 @@ func (ef *execFactory) ConstructInsert(
 	// Regular path for INSERT.
 	ins := insertNodePool.Get().(*insertNode)
 	*ins = insertNode{
-		source: input.(planNode),
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 		run: insertRun{
 			ti:         tableInserter{ri: ri},
 			checkOrds:  checkOrdSet,
@@ -1430,7 +1444,9 @@ func (ef *execFactory) ConstructInsert(
 	// observed that hasn't been validated first. See the comments
 	// on BatchedNext() in plan_batch.go.
 	if rowsNeeded {
-		return &spoolNode{source: &serializeNode{source: ins}}, nil
+		return &spoolNode{
+			singleInputPlanNode: singleInputPlanNode{&serializeNode{source: ins}},
+		}, nil
 	}
 
 	// We could use serializeNode here, but using rowCountNode is an
@@ -1524,7 +1540,9 @@ func (ef *execFactory) ConstructInsertFastPath(
 	// observed that hasn't been validated first. See the comments
 	// on BatchedNext() in plan_batch.go.
 	if rowsNeeded {
-		return &spoolNode{source: &serializeNode{source: ins}}, nil
+		return &spoolNode{
+			singleInputPlanNode: singleInputPlanNode{&serializeNode{source: ins}},
+		}, nil
 	}
 
 	// We could use serializeNode here, but using rowCountNode is an
@@ -1583,7 +1601,7 @@ func (ef *execFactory) ConstructUpdate(
 
 	upd := updateNodePool.Get().(*updateNode)
 	*upd = updateNode{
-		source: input.(planNode),
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 		run: updateRun{
 			tu:             tableUpdater{ru: ru},
 			checkOrds:      checks,
@@ -1621,7 +1639,9 @@ func (ef *execFactory) ConstructUpdate(
 	// hasn't been validated first. See the comments on BatchedNext() in
 	// plan_batch.go.
 	if rowsNeeded {
-		return &spoolNode{source: &serializeNode{source: upd}}, nil
+		return &spoolNode{
+			singleInputPlanNode: singleInputPlanNode{&serializeNode{source: upd}},
+		}, nil
 	}
 
 	// We could use serializeNode here, but using rowCountNode is an
@@ -1690,7 +1710,7 @@ func (ef *execFactory) ConstructUpsert(
 	// Instantiate the upsert node.
 	ups := upsertNodePool.Get().(*upsertNode)
 	*ups = upsertNode{
-		source: input.(planNode),
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 		run: upsertRun{
 			checkOrds:  checks,
 			insertCols: ri.InsertCols,
@@ -1725,7 +1745,9 @@ func (ef *execFactory) ConstructUpsert(
 	// hasn't been validated first. See the comments on BatchedNext() in
 	// plan_batch.go.
 	if rowsNeeded {
-		return &spoolNode{source: &serializeNode{source: ups}}, nil
+		return &spoolNode{
+			singleInputPlanNode: singleInputPlanNode{&serializeNode{source: ups}},
+		}, nil
 	}
 
 	// We could use serializeNode here, but using rowCountNode is an
@@ -1763,7 +1785,7 @@ func (ef *execFactory) ConstructDelete(
 	// Now make a delete node. We use a pool.
 	del := deleteNodePool.Get().(*deleteNode)
 	*del = deleteNode{
-		source: input.(planNode),
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 		run: deleteRun{
 			td:             tableDeleter{rd: rd, alloc: ef.getDatumAlloc()},
 			numPassthrough: len(passthrough),
@@ -1792,7 +1814,9 @@ func (ef *execFactory) ConstructDelete(
 	// hasn't been validated first. See the comments on BatchedNext() in
 	// plan_batch.go.
 	if rowsNeeded {
-		return &spoolNode{source: &serializeNode{source: del}}, nil
+		return &spoolNode{
+			singleInputPlanNode: singleInputPlanNode{&serializeNode{source: del}},
+		}, nil
 	}
 
 	// We could use serializeNode here, but using rowCountNode is an
@@ -1855,9 +1879,9 @@ func (ef *execFactory) ConstructCreateTableAs(
 	}
 
 	return &createTableNode{
-		n:          ct,
-		dbDesc:     schema.(*optSchema).database,
-		sourcePlan: input.(planNode),
+		n:      ct,
+		dbDesc: schema.(*optSchema).database,
+		input:  input.(planNode),
 	}, nil
 }
 
@@ -2010,8 +2034,8 @@ func (ef *execFactory) ConstructErrorIfRows(
 	input exec.Node, mkErr exec.MkErrFn,
 ) (exec.Node, error) {
 	return &errorIfRowsNode{
-		plan:  input.(planNode),
-		mkErr: mkErr,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		mkErr:               mkErr,
 	}, nil
 }
 
@@ -2044,10 +2068,10 @@ func (ef *execFactory) ConstructAlterTableSplit(
 	}
 
 	return &splitNode{
-		tableDesc:      index.Table().(*optTable).desc,
-		index:          index.(*optIndex).idx,
-		rows:           input.(planNode),
-		expirationTime: expirationTime,
+		tableDesc:           index.Table().(*optTable).desc,
+		index:               index.(*optIndex).idx,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		expirationTime:      expirationTime,
 	}, nil
 }
 
@@ -2063,9 +2087,9 @@ func (ef *execFactory) ConstructAlterTableUnsplit(
 		return nil, err
 	}
 	return &unsplitNode{
-		tableDesc: index.Table().(*optTable).desc,
-		index:     index.(*optIndex).idx,
-		rows:      input.(planNode),
+		tableDesc:           index.Table().(*optTable).desc,
+		index:               index.(*optIndex).idx,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 	}, nil
 }
 
@@ -2089,10 +2113,10 @@ func (ef *execFactory) ConstructAlterTableRelocate(
 	index cat.Index, input exec.Node, relocateSubject tree.RelocateSubject,
 ) (exec.Node, error) {
 	return &relocateNode{
-		subjectReplicas: relocateSubject,
-		tableDesc:       index.Table().(*optTable).desc,
-		index:           index.(*optIndex).idx,
-		rows:            input.(planNode),
+		subjectReplicas:     relocateSubject,
+		tableDesc:           index.Table().(*optTable).desc,
+		index:               index.(*optIndex).idx,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
 	}, nil
 }
 
@@ -2104,10 +2128,10 @@ func (ef *execFactory) ConstructAlterRangeRelocate(
 	fromStoreID tree.TypedExpr,
 ) (exec.Node, error) {
 	return &relocateRange{
-		rows:            input.(planNode),
-		subjectReplicas: relocateSubject,
-		toStoreID:       toStoreID,
-		fromStoreID:     fromStoreID,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		subjectReplicas:     relocateSubject,
+		toStoreID:           toStoreID,
+		fromStoreID:         fromStoreID,
 	}, nil
 }
 
@@ -2130,9 +2154,9 @@ func (ef *execFactory) ConstructControlJobs(
 	}
 
 	return &controlJobsNode{
-		rows:          input.(planNode),
-		desiredStatus: jobCommandToDesiredStatus[command],
-		reason:        reasonStr,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		desiredStatus:       jobCommandToDesiredStatus[command],
+		reason:              reasonStr,
 	}, nil
 }
 
@@ -2141,8 +2165,8 @@ func (ef *execFactory) ConstructControlSchedules(
 	command tree.ScheduleCommand, input exec.Node,
 ) (exec.Node, error) {
 	return &controlSchedulesNode{
-		rows:    input.(planNode),
-		command: command,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		command:             command,
 	}, nil
 }
 
@@ -2156,16 +2180,16 @@ func (ef *execFactory) ConstructShowCompletions(command *tree.ShowCompletions) (
 // ConstructCancelQueries is part of the exec.Factory interface.
 func (ef *execFactory) ConstructCancelQueries(input exec.Node, ifExists bool) (exec.Node, error) {
 	return &cancelQueriesNode{
-		rows:     input.(planNode),
-		ifExists: ifExists,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		ifExists:            ifExists,
 	}, nil
 }
 
 // ConstructCancelSessions is part of the exec.Factory interface.
 func (ef *execFactory) ConstructCancelSessions(input exec.Node, ifExists bool) (exec.Node, error) {
 	return &cancelSessionsNode{
-		rows:     input.(planNode),
-		ifExists: ifExists,
+		singleInputPlanNode: singleInputPlanNode{input.(planNode)},
+		ifExists:            ifExists,
 	}, nil
 }
 
@@ -2247,16 +2271,17 @@ type renderBuilder struct {
 
 // init initializes the renderNode with render expressions.
 func (rb *renderBuilder) init(n exec.Node, reqOrdering exec.OutputOrdering) {
-	src := asDataSource(n)
+	p := n.(planNode)
 	rb.r = &renderNode{
-		source: src,
+		singleInputPlanNode: singleInputPlanNode{p},
+		columns:             planColumns(p),
 	}
 	rb.r.reqOrdering = ReqOrdering(reqOrdering)
 
 	// If there's a spool, pull it up.
-	if spool, ok := rb.r.source.plan.(*spoolNode); ok {
-		rb.r.source.plan = spool.source
-		spool.source = rb.r
+	if spool, ok := rb.r.input.(*spoolNode); ok {
+		rb.r.input = spool.input
+		spool.input = rb.r
 		rb.res = spool
 	} else {
 		rb.res = rb.r

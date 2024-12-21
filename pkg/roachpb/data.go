@@ -1393,6 +1393,10 @@ func (t *Transaction) Update(o *Transaction) {
 		switch t.Status {
 		case PENDING:
 			t.Status = o.Status
+		case PREPARED:
+			if o.Status != PENDING {
+				t.Status = o.Status
+			}
 		case STAGING:
 			if o.Status != PENDING {
 				t.Status = o.Status
@@ -1403,6 +1407,8 @@ func (t *Transaction) Update(o *Transaction) {
 			}
 		case COMMITTED:
 			// Nothing to do.
+		default:
+			log.Fatalf(ctx, "unexpected txn status: %s", t.Status)
 		}
 
 		if t.ReadTimestamp == o.ReadTimestamp {
@@ -1443,8 +1449,8 @@ func (t *Transaction) Update(o *Transaction) {
 			// have incremented the txn's epoch without realizing that it was
 			// aborted.
 			t.Status = ABORTED
-		case COMMITTED:
-			log.Warningf(ctx, "updating txn %s with COMMITTED txn at earlier epoch %s", t.String(), o.String())
+		case PREPARED, COMMITTED:
+			log.Warningf(ctx, "updating txn %s with %s txn at earlier epoch %s", t.String(), o.Status, o.String())
 		}
 	}
 
@@ -2019,6 +2025,25 @@ func (l Lease) Type() LeaseType {
 		return LeaseLeader
 	}
 	return LeaseExpiration
+}
+
+// SupportsQuiescence returns whether the lease supports quiescence or not.
+func (l Lease) SupportsQuiescence() bool {
+	switch l.Type() {
+	case LeaseExpiration, LeaseLeader:
+		// Expiration based leases do not support quiescence because they'll likely
+		// be renewed soon, so there's not much point to it.
+		//
+		// Leader leases do not support quiescence because a fortified raft leader
+		// will not send raft heartbeats, so quiescence is not needed. All liveness
+		// decisions are based on store liveness communication, which is cheap
+		// enough to not need a notion of quiescence.
+		return false
+	case LeaseEpoch:
+		return true
+	default:
+		panic("unexpected lease type")
+	}
 }
 
 // Speculative returns true if this lease instance doesn't correspond to a

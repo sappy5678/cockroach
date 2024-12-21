@@ -22,6 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/raft/tracker"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -113,7 +114,14 @@ type RangeController interface {
 	CloseRaftMuLocked(ctx context.Context)
 	// InspectRaftMuLocked returns a handle containing the state of the range
 	// controller. It's used to power /inspectz-style debugging pages.
+	//
+	// Requires replica.raftMu to be held.
 	InspectRaftMuLocked(ctx context.Context) kvflowinspectpb.Handle
+	// StatusRaftMuLocked returns basic information about the range controller and
+	// its send streams.
+	//
+	// Requires replica.raftMu to be held.
+	StatusRaftMuLocked() serverpb.RACStatus
 	// SendStreamStats sets the stats for the replica send streams that belong to
 	// the range controller. It is only populated on the leader. The stats struct
 	// is provided by the caller and should be empty, it is then populated before
@@ -189,6 +197,9 @@ type ReplicaStateInfo struct {
 	// (Match, Next) is in-flight.
 	Match uint64
 	Next  uint64
+	// InflightBytes are the bytes that have been sent but not yet persisted. It
+	// corresponds to tracker.Inflights.bytes.
+	InflightBytes uint64
 }
 
 // sendQueueStatRefreshInterval is the interval at which the send queue stats
@@ -365,7 +376,8 @@ type RaftEvent struct {
 	// Entries contains the log entries to be written to storage.
 	Entries []raftpb.Entry
 	// MsgApps to followers. Only populated on the leader, when operating in
-	// MsgAppPush mode. This is informational, for bookkeeping in the callee.
+	// MsgAppPush mode. This is informational, for bookkeeping in the callee,
+	// which only looks at MsgApps with non-empty Entries.
 	//
 	// These MsgApps can be for entries in Entries, or for earlier ones.
 	// Typically, the MsgApps are ordered by entry index, and are a sequence of
@@ -433,7 +445,13 @@ func RaftEventFromMsgStorageAppendAndMsgApps(
 		event.Snap = appendMsg.Snapshot
 		event.Entries = appendMsg.Entries
 	}
-	if len(outboundMsgs) == 0 {
+	if len(outboundMsgs) == 0 || mode == MsgAppPull {
+		// MsgAppPull mode can have MsgApps with entries under some cases: (a)
+		// when the replica is in StateProbe, (b) stale MsgApps queued up inside
+		// Raft from when the replica was in StateProbe, even though it is now in
+		// StateReplicate. We ignore those in the RaftEvent created for the
+		// RangeController. They will get sent, but that is not the concern of the
+		// RACv2 code.
 		return event
 	}
 	// Clear the slices, to reuse slice allocations.
@@ -563,8 +581,16 @@ type RangeControllerOptions struct {
 	EvalWaitMetrics        *EvalWaitMetrics
 	RangeControllerMetrics *RangeControllerMetrics
 	WaitForEvalConfig      *WaitForEvalConfig
-	ReplicaMutexAsserter   ReplicaMutexAsserter
-	Knobs                  *kvflowcontrol.TestingKnobs
+	// RaftMaxInflightBytes is a soft limit on the maximum inflight bytes when
+	// using MsgAppPull mode. Currently, the RangeController only attempts to
+	// respect this when force-flushing a replicaSendStream, since the typical
+	// production configuration of this value (32MiB) is larger than the typical
+	// production configuration of the shared regular token pool (16MiB), so
+	// attempting to respect this when doing non-force-flush sends is
+	// unnecessary.
+	RaftMaxInflightBytes uint64
+	ReplicaMutexAsserter ReplicaMutexAsserter
+	Knobs                *kvflowcontrol.TestingKnobs
 }
 
 // RangeControllerInitState is the initial state at the time of creation.
@@ -682,6 +708,9 @@ func NewRangeController(
 ) *rangeController {
 	if log.V(1) {
 		log.VInfof(ctx, 1, "r%v creating range controller", o.RangeID)
+	}
+	if o.RaftMaxInflightBytes == 0 {
+		o.RaftMaxInflightBytes = math.MaxUint64
 	}
 	rc := &rangeController{
 		opts:            o,
@@ -873,10 +902,15 @@ type raftEventForReplica struct {
 	// Reminder: (ReplicaStateInfo.Match, ReplicaStateInfo.Next) are in-flight.
 	// nextRaftIndex is where the next entry will be added.
 	//
-	// ReplicaStateInfo.{State, Match} are the latest state.
+	// ReplicaStateInfo.{State, Match, InflightBytes} are the latest state.
 	// ReplicaStateInfo.Next represents the state preceding this raft event,
-	// i.e., it will be altered by sendingEntries. nextRaftIndex also represents
-	// the state preceding this event, and will be altered by newEntries.
+	// i.e., it will be altered by sendingEntries. Note that InflightBytes
+	// already incorporates sendingEntries -- we could choose to iterate over
+	// the sending entries in constructRaftEventForReplica and compensate for
+	// them, but we don't bother.
+	//
+	// nextRaftIndex also represents the state preceding this event, and will be
+	// altered by newEntries.
 	//
 	// createSendStream is set to true if the replicaSendStream should be
 	// (re)created.
@@ -1047,9 +1081,10 @@ func constructRaftEventForReplica(
 	refr := raftEventForReplica{
 		mode: mode,
 		replicaStateInfo: ReplicaStateInfo{
-			State: latestReplicaStateInfo.State,
-			Match: latestReplicaStateInfo.Match,
-			Next:  next,
+			State:         latestReplicaStateInfo.State,
+			Match:         latestReplicaStateInfo.Match,
+			Next:          next,
+			InflightBytes: latestReplicaStateInfo.InflightBytes,
 		},
 		nextRaftIndex:      raftEventAppendState.rewoundNextRaftIndex,
 		newEntries:         raftEventAppendState.newEntries,
@@ -1617,6 +1652,50 @@ func (rc *rangeController) InspectRaftMuLocked(ctx context.Context) kvflowinspec
 	}
 }
 
+// StatusRaftMuLocked returns basic information about the range controller and
+// its send streams.
+//
+// Requires replica.raftMu to be held.
+func (rc *rangeController) StatusRaftMuLocked() serverpb.RACStatus {
+	rc.opts.ReplicaMutexAsserter.RaftMuAssertHeld()
+	status := serverpb.RACStatus{
+		NextRaftIndex:   rc.nextRaftIndex,
+		ForceFlushIndex: rc.forceFlushIndex,
+		Streams:         map[uint64]serverpb.RACStatus_Stream{},
+	}
+	for id, rs := range rc.replicaMap {
+		if rs.sendStream == nil {
+			continue
+		}
+		var s serverpb.RACStatus_Stream
+		func() {
+			// TODO(pav-kv): locking is unnecessary, since indexToSend, nextRaftIndex,
+			// and eval.tokensDeducted are always updated under raftMu. Update the
+			// locking semantics in rs.sendStream.
+			rs.sendStream.mu.Lock()
+			defer rs.sendStream.mu.Unlock()
+			s.IndexToSend = rs.sendStream.mu.sendQueue.indexToSend
+			s.NextRaftIndexInitial = rs.sendStream.mu.nextRaftIndexInitial
+			s.NextRaftIndex = rs.sendStream.mu.sendQueue.nextRaftIndex
+			s.ForceFlushStopIndex = uint64(rs.sendStream.mu.sendQueue.forceFlushStopIndex)
+			s.EvalTokensHeld = convertTokensSlice(rs.sendStream.mu.eval.tokensDeducted[:])
+		}()
+		if rs.sendStream.holdsTokensRaftMuLocked() {
+			s.SendTokensHeld = convertTokensSlice(rs.sendStream.raftMu.tracker.deducted[:])
+		}
+		status.Streams[uint64(id)] = s
+	}
+	return status
+}
+
+func convertTokensSlice(tokens []kvflowcontrol.Tokens) []int64 {
+	result := make([]int64, len(tokens))
+	for i, tok := range tokens {
+		result[i] = int64(tok)
+	}
+	return result
+}
+
 func (rc *rangeController) SendStreamStats(statsToSet *RangeSendStreamStats) {
 	if len(statsToSet.internal) != 0 {
 		panic(errors.AssertionFailedf("statsToSet is non-empty %v", statsToSet.internal))
@@ -2110,6 +2189,10 @@ type replicaSendStream struct {
 			tokenWatcherHandle         SendTokenWatcherHandle
 			deductedForSchedulerTokens kvflowcontrol.Tokens
 		}
+		// inflightBytes is the sum of bytes that are inflight, i.e., in
+		// (ReplicaStateInfo.Match,ReplicaStateInfo.Next).
+		inflightBytes uint64
+
 		// TODO(sumeer): remove closed. Whenever a replicaSendStream is closed it
 		// is also no longer referenced by replicaState. The only motivation for
 		// closed is that replicaSendStream.Notify calls directly into
@@ -2514,6 +2597,13 @@ func (rs *replicaState) scheduledRaftMuLocked(
 		rss.tryHandleModeChangeRaftMuAndStreamLocked(ctx, mode, false, false)
 		return false, false
 	}
+	forceFlushActiveAndPaused := func() bool {
+		return rss.mu.sendQueue.forceFlushStopIndex.active() &&
+			rss.reachedInflightBytesThresholdRaftMuAndStreamLocked()
+	}
+	if forceFlushActiveAndPaused() {
+		return false, false
+	}
 	// 4MB. Don't want to hog the scheduler thread for too long.
 	const MaxBytesToSend kvflowcontrol.Tokens = 4 << 20
 	bytesToSend := MaxBytesToSend
@@ -2561,6 +2651,7 @@ func (rs *replicaState) scheduledRaftMuLocked(
 		rs.sendStream = nil
 		return false, true
 	}
+	rss.updateInflightRaftMuAndStreamLocked(slice)
 	rss.dequeueFromQueueAndSendRaftMuAndStreamLocked(ctx, msg)
 	isEmpty := rss.isEmptySendQueueStreamLocked()
 	if isEmpty {
@@ -2577,12 +2668,14 @@ func (rs *replicaState) scheduledRaftMuLocked(
 		// next tick. We accept a latency hiccup in this case for now.
 		rss.mu.sendQueue.forceFlushStopIndex = 0
 	}
+	forceFlushNeedsToPause := forceFlushActiveAndPaused()
 	watchForTokens :=
 		!rss.mu.sendQueue.forceFlushStopIndex.active() && rss.mu.sendQueue.deductedForSchedulerTokens == 0
 	if watchForTokens {
 		rss.startAttemptingToEmptySendQueueViaWatcherStreamLocked(ctx)
 	}
-	return !watchForTokens, false
+	scheduleAgain = !watchForTokens && !forceFlushNeedsToPause
+	return scheduleAgain, false
 }
 
 func (rs *replicaState) closeSendStreamRaftMuLocked(ctx context.Context) {
@@ -2641,6 +2734,9 @@ func (rss *replicaSendStream) handleReadyEntriesRaftMuAndStreamLocked(
 	wasEmptySendQ := rss.isEmptySendQueueStreamLocked()
 	rss.tryHandleModeChangeRaftMuAndStreamLocked(
 		ctx, event.mode, wasEmptySendQ, directive.forceFlushStopIndex.active())
+	// Use the latest inflight bytes, since it reflects the advancing Match.
+	wasExceedingInflightBytesThreshold := rss.reachedInflightBytesThresholdRaftMuAndStreamLocked()
+	rss.mu.inflightBytes = event.replicaStateInfo.InflightBytes
 	if event.mode == MsgAppPull {
 		// MsgAppPull mode (i.e., followers). Populate sendingEntries.
 		n := len(event.sendingEntries)
@@ -2649,12 +2745,18 @@ func (rss *replicaSendStream) handleReadyEntriesRaftMuAndStreamLocked(
 				rss.parent.desc.ReplicaID == rss.parent.parent.opts.LocalReplicaID))
 		}
 		if directive.forceFlushStopIndex.active() {
+			// Must have a send-queue, so sendingEntries should stay empty (these
+			// will be queued).
 			if !rss.mu.sendQueue.forceFlushStopIndex.active() {
-				// Must have a send-queue, so sendingEntries should stay empty
-				// (these will be queued).
 				rss.startForceFlushRaftMuAndStreamLocked(ctx, directive.forceFlushStopIndex)
-			} else if rss.mu.sendQueue.forceFlushStopIndex != directive.forceFlushStopIndex {
-				rss.mu.sendQueue.forceFlushStopIndex = directive.forceFlushStopIndex
+			} else {
+				if rss.mu.sendQueue.forceFlushStopIndex != directive.forceFlushStopIndex {
+					rss.mu.sendQueue.forceFlushStopIndex = directive.forceFlushStopIndex
+				}
+				if wasExceedingInflightBytesThreshold &&
+					!rss.reachedInflightBytesThresholdRaftMuAndStreamLocked() {
+					rss.parent.parent.scheduleReplica(rss.parent.desc.ReplicaID)
+				}
 			}
 		} else {
 			// INVARIANT: !directive.forceFlushStopIndex.active()
@@ -2797,6 +2899,7 @@ func (rss *replicaSendStream) handleReadyEntriesRaftMuAndStreamLocked(
 			return false,
 				errors.Errorf("SendMsgApp could not send for replica %d", rss.parent.desc.ReplicaID)
 		}
+		rss.updateInflightRaftMuAndStreamLocked(slice)
 		rss.parent.parent.opts.MsgAppSender.SendMsgApp(ctx, msg, false)
 	}
 
@@ -2814,6 +2917,16 @@ func (rss *replicaSendStream) handleReadyEntriesRaftMuAndStreamLocked(
 	// WaitForEval, so we accept this behavior.
 	transitionedSendQState = wasEmptySendQ != hasEmptySendQ
 	return transitionedSendQState, nil
+}
+
+func (rss *replicaSendStream) updateInflightRaftMuAndStreamLocked(ls raft.LogSlice) {
+	rss.parent.parent.opts.ReplicaMutexAsserter.RaftMuAssertHeld()
+	rss.mu.AssertHeld()
+	entries := ls.Entries()
+	for i := range ls.Entries() {
+		// NB: raft.payloadSize also uses len(raftpb.Entry.Data).
+		rss.mu.inflightBytes += uint64(len(entries[i].Data))
+	}
 }
 
 func (rss *replicaSendStream) tryHandleModeChangeRaftMuAndStreamLocked(
@@ -2857,6 +2970,12 @@ func (rss *replicaSendStream) tryHandleModeChangeRaftMuAndStreamLocked(
 	}
 }
 
+func (rss *replicaSendStream) reachedInflightBytesThresholdRaftMuAndStreamLocked() bool {
+	rss.parent.parent.opts.ReplicaMutexAsserter.RaftMuAssertHeld()
+	rss.mu.AssertHeld()
+	return rss.mu.inflightBytes >= rss.parent.parent.opts.RaftMaxInflightBytes
+}
+
 func (rss *replicaSendStream) startForceFlushRaftMuAndStreamLocked(
 	ctx context.Context, forceFlushStopIndex forceFlushStopIndex,
 ) {
@@ -2864,7 +2983,9 @@ func (rss *replicaSendStream) startForceFlushRaftMuAndStreamLocked(
 	rss.mu.AssertHeld()
 	rss.parent.parent.opts.RangeControllerMetrics.SendQueue.ForceFlushedScheduledCount.Inc(1)
 	rss.mu.sendQueue.forceFlushStopIndex = forceFlushStopIndex
-	rss.parent.parent.scheduleReplica(rss.parent.desc.ReplicaID)
+	if !rss.reachedInflightBytesThresholdRaftMuAndStreamLocked() {
+		rss.parent.parent.scheduleReplica(rss.parent.desc.ReplicaID)
+	}
 	rss.stopAttemptingToEmptySendQueueViaWatcherRaftMuAndStreamLocked(ctx, false)
 }
 

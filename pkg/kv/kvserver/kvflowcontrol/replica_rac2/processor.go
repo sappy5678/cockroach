@@ -18,6 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/raft"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -362,7 +363,15 @@ type Processor interface {
 	// InspectRaftMuLocked returns a handle to inspect the state of the
 	// underlying range controller. It is used to power /inspectz-style debugging
 	// pages.
+	//
+	// raftMu is held.
 	InspectRaftMuLocked(ctx context.Context) (kvflowinspectpb.Handle, bool)
+	// StatusRaftMuLocked returns basic information about the underlying range
+	// controller and its send streams.
+	//
+	// raftMu is held.
+	StatusRaftMuLocked() serverpb.RACStatus
+
 	// SendStreamStats sets the stats for the replica send streams that belong to
 	// the range controller. It is only populated on the leader. The stats struct
 	// is provided by the caller and should be empty, it is then populated before
@@ -922,7 +931,7 @@ func (p *processorImpl) AdmitRaftEntriesRaftMuLocked(ctx context.Context, e rac2
 			if isV2Encoding {
 				log.Infof(ctx,
 					"decoded v2 raft admission meta below-raft: pri=%v create-time=%d "+
-						"proposer=n%v receiver=[n%d,s%v] tenant=t%d tokens≈%d "+
+						"proposer=n%v receiver=[n%d,s%v] tenant=t%d tokens≈%v "+
 						"sideloaded=%t raft-entry=%d/%d lead-v2=%v",
 					raftpb.Priority(meta.AdmissionPriority),
 					meta.AdmissionCreateTime,
@@ -939,7 +948,7 @@ func (p *processorImpl) AdmitRaftEntriesRaftMuLocked(ctx context.Context, e rac2
 			} else {
 				log.Infof(ctx,
 					"decoded v1 raft admission meta below-raft: pri=%v create-time=%d "+
-						"proposer=n%v receiver=[n%d,s%v] tenant=t%d tokens≈%d "+
+						"proposer=n%v receiver=[n%d,s%v] tenant=t%d tokens≈%v "+
 						"sideloaded=%t raft-entry=%d/%d lead-v2=%v",
 					admissionpb.WorkPriority(meta.AdmissionPriority),
 					meta.AdmissionCreateTime,
@@ -1187,6 +1196,15 @@ func (p *processorImpl) InspectRaftMuLocked(ctx context.Context) (kvflowinspectp
 	return p.leader.rc.InspectRaftMuLocked(ctx), true
 }
 
+// StatusRaftMuLocked implements Processor.
+func (p *processorImpl) StatusRaftMuLocked() serverpb.RACStatus {
+	p.opts.ReplicaMutexAsserter.RaftMuAssertHeld()
+	if p.leader.rc == nil {
+		return serverpb.RACStatus{}
+	}
+	return p.leader.rc.StatusRaftMuLocked()
+}
+
 // SendStreamStats implements Processor.
 func (p *processorImpl) SendStreamStats(stats *rac2.RangeSendStreamStats) {
 	p.leader.rcReferenceUpdateMu.RLock()
@@ -1211,6 +1229,7 @@ type RangeControllerFactoryImpl struct {
 	scheduler                  rac2.Scheduler
 	sendTokenWatcher           *rac2.SendTokenWatcher
 	waitForEvalConfig          *rac2.WaitForEvalConfig
+	raftMaxInflightBytes       uint64
 	knobs                      *kvflowcontrol.TestingKnobs
 }
 
@@ -1223,6 +1242,7 @@ func NewRangeControllerFactoryImpl(
 	scheduler rac2.Scheduler,
 	sendTokenWatcher *rac2.SendTokenWatcher,
 	waitForEvalConfig *rac2.WaitForEvalConfig,
+	raftMaxInflightBytes uint64,
 	knobs *kvflowcontrol.TestingKnobs,
 ) RangeControllerFactoryImpl {
 	return RangeControllerFactoryImpl{
@@ -1234,6 +1254,7 @@ func NewRangeControllerFactoryImpl(
 		scheduler:                  scheduler,
 		sendTokenWatcher:           sendTokenWatcher,
 		waitForEvalConfig:          waitForEvalConfig,
+		raftMaxInflightBytes:       raftMaxInflightBytes,
 		knobs:                      knobs,
 	}
 }
@@ -1258,6 +1279,7 @@ func (f RangeControllerFactoryImpl) New(
 			EvalWaitMetrics:        f.evalWaitMetrics,
 			RangeControllerMetrics: f.rangeControllerMetrics,
 			WaitForEvalConfig:      f.waitForEvalConfig,
+			RaftMaxInflightBytes:   f.raftMaxInflightBytes,
 			ReplicaMutexAsserter:   state.muAsserter,
 			Knobs:                  f.knobs,
 		},

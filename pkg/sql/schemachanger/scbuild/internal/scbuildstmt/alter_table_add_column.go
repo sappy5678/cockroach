@@ -21,6 +21,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/seqexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
+	"github.com/cockroachdb/cockroach/pkg/sql/parser"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgnotice"
@@ -47,25 +48,21 @@ func alterTableAddColumn(
 	fallBackIfRegionalByRowTable(b, t, tbl.TableID)
 
 	// Check column non-existence.
-	{
-		elts := b.ResolveColumn(tbl.TableID, d.Name, ResolveParams{
-			IsExistenceOptional: true,
-			RequiredPrivilege:   privilege.CREATE,
-		})
-		_, colTargetStatus, col := scpb.FindColumn(elts)
-		if col != nil {
-			if t.IfNotExists {
-				return
-			}
-			if col.IsSystemColumn {
-				panic(pgerror.Newf(pgcode.DuplicateColumn,
-					"column name %q conflicts with a system column name",
-					d.Name))
-			}
-			if colTargetStatus != scpb.ToAbsent {
-				panic(sqlerrors.NewColumnAlreadyExistsInRelationError(string(d.Name), tn.Object()))
-			}
+	elts := b.ResolveColumn(tbl.TableID, d.Name, ResolveParams{
+		IsExistenceOptional: true,
+		RequiredPrivilege:   privilege.CREATE,
+	})
+	_, colTargetStatus, col := scpb.FindColumn(elts)
+	columnAlreadyExists := col != nil && colTargetStatus != scpb.ToAbsent
+	// If the column exists and IF NOT EXISTS is specified, continue parsing
+	// to ensure there are no other errors before treating the operation as a no-op.
+	if columnAlreadyExists && !t.IfNotExists {
+		if col.IsSystemColumn {
+			panic(pgerror.Newf(pgcode.DuplicateColumn,
+				"column name %q conflicts with a system column name",
+				d.Name))
 		}
+		panic(sqlerrors.NewColumnAlreadyExistsInRelationError(string(d.Name), tn.Object()))
 	}
 	var colSerialDefaultExpression *scpb.Expression
 	if d.IsSerial {
@@ -114,6 +111,13 @@ func alterTableAddColumn(
 	if err != nil {
 		panic(err)
 	}
+
+	// Parsing of the ALTER statement is complete, and no further errors are possible.
+	// If the column already exists, exit here to make the operation a no-op.
+	if columnAlreadyExists {
+		return
+	}
+
 	desc := cdd.ColumnDescriptor
 	desc.ID = b.NextTableColumnID(tbl)
 	spec := addColumnSpec{
@@ -188,6 +192,38 @@ func alterTableAddColumn(
 		} else {
 			b.IncrementSchemaChangeAddColumnQualificationCounter("computed")
 		}
+
+		// To validate, we add a transient check constraint. It uses an assignment
+		// cast to verify that the computed column expression fits in to the column
+		// type. This constraint is temporary and doesn't need to persist beyond the
+		// ALTER operation. The CHECK expression returns true for every row, but
+		// since it uses `assignment_cast`, the expression will fail with an error
+		// if a row is invalid.
+		var typeRef tree.ResolvableTypeReference = spec.colType.Type
+		if types.IsOIDUserDefinedType(spec.colType.Type.Oid()) {
+			typeRef = &tree.OIDTypeReference{OID: spec.colType.Type.Oid()}
+		}
+		checkExpr, err := parser.ParseExpr(fmt.Sprintf(
+			"CASE WHEN (crdb_internal.assignment_cast(%s, NULL::%s)) IS NULL THEN TRUE ELSE TRUE END",
+			expr.Expr, typeRef.SQLString(),
+		))
+		if err != nil {
+			panic(err)
+		}
+
+		// The constraint requires a backing index to use, which we will use the
+		// primary index.
+		indexID := getLatestPrimaryIndex(b, tbl.TableID).IndexID
+		// Collect all the table columns IDs.
+		colIDs := getSortedColumnIDsInIndex(b, tbl.TableID, indexID)
+		chk := scpb.CheckConstraint{
+			TableID:              tbl.TableID,
+			Expression:           *b.WrapExpression(tbl.TableID, checkExpr),
+			ConstraintID:         b.NextTableConstraintID(tbl.TableID),
+			IndexIDForValidation: indexID,
+			ColumnIDs:            colIDs,
+		}
+		b.AddTransient(&chk) // Adding it as transient ensures it doesn't survive past the ALTER.
 	}
 	if d.HasColumnFamily() {
 		elts := b.QueryByID(tbl.TableID)

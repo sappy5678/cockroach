@@ -251,12 +251,12 @@ txn_id  txn_fingerprint_id  query  implicit_txn  session_id  start_time  end_tim
 query ITTI
 SELECT range_id, start_pretty, end_pretty, lease_holder FROM crdb_internal.ranges
 ----
-74  /Tenant/10  /Tenant/11  1
+75  /Tenant/10  /Tenant/11  1
 
 query ITT
 SELECT range_id, start_pretty, end_pretty FROM crdb_internal.ranges_no_leases
 ----
-74  /Tenant/10  /Tenant/11
+75  /Tenant/10  /Tenant/11
 
 query IT
 SELECT zone_id, target FROM crdb_internal.zones ORDER BY 1
@@ -479,8 +479,8 @@ CREATE TYPE enum2 AS ENUM ()
 query ITTITTT
 SELECT * FROM crdb_internal.create_type_statements ORDER BY descriptor_id
 ----
-104  test  public  113  enum1  CREATE TYPE public.enum1 AS ENUM ('hello', 'hi')  {hello,hi}
-104  test  public  115  enum2  CREATE TYPE public.enum2 AS ENUM ()               {}
+104  test  public  113  enum1  CREATE TYPE test.public.enum1 AS ENUM ('hello', 'hi')  {hello,hi}
+104  test  public  115  enum2  CREATE TYPE test.public.enum2 AS ENUM ()               {}
 
 # Test the virtual index as well.
 

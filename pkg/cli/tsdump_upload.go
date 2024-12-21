@@ -37,6 +37,10 @@ const (
 	DatadogSeriesTypeRate
 	DatadogSeriesTypeGauge
 )
+const (
+	UploadStatusSuccess = "Success"
+	UploadStatusFailure = "Failed"
+)
 
 var (
 	// each site in datadog has a different host name. ddSiteToHostMap
@@ -53,7 +57,12 @@ var (
 	targetURLFormat           = "https://api.%s/api/v2/series"
 	datadogDashboardURLFormat = "https://us5.datadoghq.com/dashboard/bif-kwe-gx2/self-hosted-db-console-tsdump?" +
 		"tpl_var_cluster=%s&tpl_var_upload_id=%s&tpl_var_upload_day=%d&tpl_var_upload_month=%d&tpl_var_upload_year=%d&from_ts=%d&to_ts=%d"
-	zipFileSignature = []byte{0x50, 0x4B, 0x03, 0x04}
+	zipFileSignature            = []byte{0x50, 0x4B, 0x03, 0x04}
+	logMessageFormat            = "tsdump upload to datadog is partially failed for metric: %s"
+	partialFailureMessageFormat = "The Tsdump upload to Datadog succeeded but %d metrics partially failed to upload." +
+		" These failures can be due to transietnt network errors. If any of these metrics are critical for your investigation," +
+		" please re-upload the Tsdump:\n%s\n"
+	datadogLogsURLFormat = "https://us5.datadoghq.com/logs?query=cluster_label:%s+upload_id:%s"
 )
 
 // DatadogPoint is a single metric point in Datadog format
@@ -207,12 +216,14 @@ func dump(kv *roachpb.KeyValue) (*DatadogSeries, error) {
 
 var printLock syncutil.Mutex
 
-func (d *datadogWriter) emitDataDogMetrics(data []DatadogSeries) error {
+func (d *datadogWriter) emitDataDogMetrics(data []DatadogSeries) ([]string, error) {
 	tags := getUploadTags(d)
 
+	emittedMetrics := make([]string, len(data))
 	for i := 0; i < len(data); i++ {
 		data[i].Tags = append(data[i].Tags, tags...)
 		data[i].Metric = d.namePrefix + data[i].Metric
+		emittedMetrics[i] = data[i].Metric
 	}
 
 	// When running in init mode, we insert zeros with the current
@@ -242,7 +253,7 @@ func (d *datadogWriter) emitDataDogMetrics(data []DatadogSeries) error {
 		)
 	}()
 
-	return d.flush(data)
+	return emittedMetrics, d.flush(data)
 }
 
 func getUploadTags(d *datadogWriter) []string {
@@ -294,7 +305,8 @@ func (d *datadogWriter) flush(data []DatadogSeries) error {
 	}
 
 	retryOpts := base.DefaultRetryOptions()
-	retryOpts.MaxRetries = 5
+	retryOpts.MaxBackoff = 2 * time.Second
+	retryOpts.MaxRetries = 100
 	var req *http.Request
 	for retry := retry.Start(retryOpts); retry.Next(); {
 		req, err = http.NewRequest("POST", d.targetURL, &zipBuf)
@@ -311,6 +323,7 @@ func (d *datadogWriter) flush(data []DatadogSeries) error {
 		}
 	}
 	return err
+
 }
 
 func (d *datadogWriter) upload(fileName string) error {
@@ -344,12 +357,20 @@ func (d *datadogWriter) upload(fileName string) error {
 	var wg sync.WaitGroup
 	ch := make(chan []DatadogSeries, 4000)
 
-	// errorsInDDUpload wraps the error collection in a mutex since
+	// metricsUploadState wraps the failed metrics collection in a mutex since
 	// they're collected concurrently.
-	var errorsInDDUpload struct {
+	var metricsUploadState struct {
 		syncutil.Mutex
-		errors []string
+		// we are taking map here as we want unique metric names which were failed across all tsdump upload requests.
+		uploadFailedMetrics     map[string]struct{}
+		isSingleUploadSucceeded bool
 	}
+	metricsUploadState.uploadFailedMetrics = make(map[string]struct{})
+	metricsUploadState.isSingleUploadSucceeded = false
+
+	markSuccessOnce := sync.OnceFunc(func() {
+		metricsUploadState.isSingleUploadSucceeded = true
+	})
 
 	// Note(davidh): This was previously set at 1000 and we'd get regular
 	// 400s from Datadog with the cryptic `Unable to decompress payload`
@@ -358,16 +379,19 @@ func (d *datadogWriter) upload(fileName string) error {
 	for i := 0; i < 10; i++ {
 		go func() {
 			for data := range ch {
-				err := d.emitDataDogMetrics(data)
+				emittedMetrics, err := d.emitDataDogMetrics(data)
 				if err != nil {
 					func() {
-						errorsInDDUpload.Lock()
-						defer errorsInDDUpload.Unlock()
-						errorsInDDUpload.errors = append(errorsInDDUpload.errors,
-							fmt.Sprintf("retries exhausted for datadog upload for series %s with error %v\n", data[0].Metric, err))
+						metricsUploadState.Lock()
+						defer metricsUploadState.Unlock()
+						for _, metric := range emittedMetrics {
+							metricsUploadState.uploadFailedMetrics[metric] = struct{}{}
+						}
 					}()
-					wg.Done()
-					return
+				} else {
+					func() {
+						markSuccessOnce()
+					}()
 				}
 				wg.Done()
 			}
@@ -394,11 +418,69 @@ func (d *datadogWriter) upload(fileName string) error {
 	year, month, day := d.uploadTime.Date()
 	dashboardLink := fmt.Sprintf(datadogDashboardURLFormat, debugTimeSeriesDumpOpts.clusterLabel, d.uploadID, day, int(month), year, fromUnixTimestamp, toUnixTimestamp)
 
-	if len(errorsInDDUpload.errors) != 0 {
-		fmt.Printf("\n%d upload errors occurred:\n%s\n", len(errorsInDDUpload.errors), strings.Join(errorsInDDUpload.errors, "\n"))
+	var uploadStatus string
+	if metricsUploadState.isSingleUploadSucceeded {
+		uploadStatus = UploadStatusSuccess
+	} else {
+		uploadStatus = UploadStatusFailure
 	}
-	fmt.Println("\nupload id:", d.uploadID)
-	fmt.Printf("datadog dashboard link: %s\n", dashboardLink)
+	fmt.Printf("\nUpload status: %s!\n", uploadStatus)
+
+	if metricsUploadState.isSingleUploadSucceeded {
+		var isDatadogUploadFailed = false
+		markDatadogUploadFailedOnce := sync.OnceFunc(func() {
+			isDatadogUploadFailed = true
+		})
+		if len(metricsUploadState.uploadFailedMetrics) != 0 {
+			fmt.Printf(partialFailureMessageFormat, len(metricsUploadState.uploadFailedMetrics), strings.Join(func() []string {
+				var failedMetricsList []string
+				index := 1
+				for metric := range metricsUploadState.uploadFailedMetrics {
+					metric = fmt.Sprintf("%d) %s", index, metric)
+					failedMetricsList = append(failedMetricsList, metric)
+					index++
+				}
+				return failedMetricsList
+			}(), "\n"))
+
+			tags := strings.Join(getUploadTags(d), ",")
+			fmt.Println("\nPushing logs of metric upload failures to datadog...")
+			for metric := range metricsUploadState.uploadFailedMetrics {
+				wg.Add(1)
+				go func(metric string) {
+					logMessage := fmt.Sprintf(logMessageFormat, metric)
+
+					logEntryJSON, _ := json.Marshal(struct {
+						Message any    `json:"message,omitempty"`
+						Tags    string `json:"ddtags,omitempty"`
+						Source  string `json:"ddsource,omitempty"`
+					}{
+						Message: logMessage,
+						Tags:    tags,
+						Source:  "tsdump_upload",
+					})
+
+					_, err := uploadLogsToDatadog(logEntryJSON, d.apiKey, debugTimeSeriesDumpOpts.ddSite)
+					if err != nil {
+						markDatadogUploadFailedOnce()
+					}
+					wg.Done()
+				}(metric)
+			}
+
+			wg.Wait()
+			if isDatadogUploadFailed {
+				fmt.Println("Failed to pushed some metrics to datadog logs. Please refer CLI output for all failed metrics.")
+			} else {
+				fmt.Println("Pushing logs of metric upload failures to datadog...done")
+				fmt.Printf("datadog logs for metric upload failures link: %s\n", fmt.Sprintf(datadogLogsURLFormat, debugTimeSeriesDumpOpts.clusterLabel, d.uploadID))
+			}
+		}
+		fmt.Println("\nupload id:", d.uploadID)
+		fmt.Printf("datadog dashboard link: %s\n", dashboardLink)
+	} else {
+		fmt.Println("All metric upload is failed. Please re-upload the Tsdump.")
+	}
 
 	close(ch)
 	return nil

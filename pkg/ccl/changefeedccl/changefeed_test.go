@@ -20,6 +20,7 @@ import (
 	"path"
 	"reflect"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,6 +67,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/randgen"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/storage/fs"
@@ -90,6 +92,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/span"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
 	"github.com/dustin/go-humanize"
@@ -164,19 +167,16 @@ func TestChangefeedBasicQuery(t *testing.T) {
 		assertPayloads(t, foo, []string{
 			`foo: [0]->{"a": 0, "b": "updated", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
 		assertPayloads(t, foo, []string{
 			`foo: [1]->{"a": 1, "b": "a", "cdc_prev": null, "op": "insert"}`,
 			`foo: [2]->{"a": 2, "b": "b", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		sqlDB.Exec(t, `UPSERT INTO foo VALUES (2, 'c'), (3, 'd')`)
 		assertPayloads(t, foo, []string{
 			`foo: [2]->{"a": 2, "b": "c", "cdc_prev": {"a": 2, "b": "b"}, "op": "update"}`,
 			`foo: [3]->{"a": 3, "b": "d", "cdc_prev": null, "op": "insert"}`,
 		})
-
 		// Deleted rows with bare envelope are emitted with only
 		// the key columns set.
 		sqlDB.Exec(t, `DELETE FROM foo WHERE a = 1`)
@@ -186,6 +186,109 @@ func TestChangefeedBasicQuery(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+// TestChangefeedIdentifyDependentTablesForProtecting identifies (system) tables
+// that are accessed in the course of running a changefeed and ensures that they
+// are all in the list of tables we protect with PTS. It does this by running a
+// sinkless changefeed and capturing a trace of its execution. For completeness,
+// it includes a cdc query in the changefeed, under the assumption that doing so
+// will require more tables.
+func TestChangefeedIdentifyDependentTablesForProtecting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cfCreated := atomic.Bool{}
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (0, 'initial')`)
+		foo := feed(t, f, `CREATE CHANGEFEED AS SELECT *, event_op() AS op, cdc_prev FROM foo`)
+		defer closeFeed(t, foo)
+		cfCreated.Store(true)
+
+		assertPayloads(t, foo, []string{
+			`foo: [0]->{"a": 0, "b": "initial", "cdc_prev": null, "op": "insert"}`,
+		})
+
+		// Do some operations so the changefeed does some scanning.
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1, 'a'), (2, 'b')`)
+		sqlDB.Exec(t, `UPSERT INTO foo VALUES (2, 'c'), (3, 'd')`)
+		sqlDB.Exec(t, `DELETE FROM foo WHERE a = 1`)
+
+		assertPayloads(t, foo, []string{
+			`foo: [1]->{"a": 1, "b": "a", "cdc_prev": null, "op": "insert"}`,
+			`foo: [2]->{"a": 2, "b": "b", "cdc_prev": null, "op": "insert"}`,
+			`foo: [2]->{"a": 2, "b": "c", "cdc_prev": {"a": 2, "b": "b"}, "op": "update"}`,
+			`foo: [3]->{"a": 3, "b": "d", "cdc_prev": null, "op": "insert"}`,
+			`foo: [1]->{"a": 1, "b": null, "cdc_prev": {"a": 1, "b": "a"}, "op": "delete"}`,
+		})
+	}
+
+	trimRx := regexp.MustCompile(`executing (.*), \[txn:.*`)
+	tableIdRx := regexp.MustCompile(`(/Tenant/[0-9]+)?/(Table|NamespaceTable)/([0-9]+)`)
+
+	tableIDsAccessed := map[catid.DescID]struct{}{}
+
+	// Parse trace logs of the following format into table ids and add them to our map:
+	// `executing Scan [/Tenant/10/Table/3/1,/Tenant/10/Table/3/2), Scan [/Tenant/10/NamespaceTable/30/1,/Tenant/10/NamespaceTable/30/2), ...`
+	// This seems a bit brittle, but it's the best we can do currently.
+	noteExecutingScansLog := func(msg string) {
+		trimmed := trimRx.FindStringSubmatch(msg)[1]
+		spanStmts := strings.Split(trimmed, ", ")
+		for _, spanStmt := range spanStmts {
+			spanStmt = strings.Replace(spanStmt, "Scan ", "", 1)
+			startEnd := strings.Split(strings.Trim(spanStmt, "[)"), ",")
+			require.Len(t, startEnd, 2)
+
+			start := startEnd[0]
+			matches := tableIdRx.FindStringSubmatch(start)
+			require.NotEmpty(t, matches)
+
+			tableID, err := strconv.ParseInt(matches[3], 10, 64)
+			require.NoError(t, err)
+			tableIDsAccessed[catid.DescID(tableID)] = struct{}{}
+		}
+	}
+
+	traceCb := func(trace tracingpb.Recording, stmt string) {
+		if !cfCreated.Load() {
+			return
+		}
+		if !strings.HasPrefix(stmt, "CREATE CHANGEFEED") {
+			return
+		}
+		for _, span := range trace {
+			for _, log := range span.Logs {
+				msg := log.Message.StripMarkers()
+				if !strings.Contains(msg, "executing Scan") {
+					continue
+				}
+				noteExecutingScansLog(msg)
+			}
+		}
+	}
+
+	cdcTest(t, testFn, withKnobsFn(func(knobs *base.TestingKnobs) {
+		knobs.JobsTestingKnobs = jobs.NewTestingKnobsWithShortIntervals()
+		if knobs.SQLExecutor == nil {
+			knobs.SQLExecutor = &sql.ExecutorTestingKnobs{}
+		}
+		knobs.SQLExecutor.(*sql.ExecutorTestingKnobs).WithStatementTrace = traceCb
+	}), feedTestForceSink("sinkless"))
+
+	// NOTE: not all the required tables will necessarily show up in every run due to caching. However we should always see SOME tables.
+	require.NotEmpty(t, tableIDsAccessed)
+
+	var unexpectedTableIDs []catid.DescID
+	for id := range tableIDsAccessed {
+		if !slices.Contains(systemTablesToProtect, id) {
+			unexpectedTableIDs = append(unexpectedTableIDs, id)
+		}
+	}
+	require.Empty(t, unexpectedTableIDs)
 }
 
 // Same test as TestChangefeedBasicQuery, but using wrapped envelope with CDC query.
@@ -432,6 +535,20 @@ func TestChangefeedProgressMetrics(t *testing.T) {
 				})
 			}
 
+			// Verify that max_behind_nanos has recurring updates
+			var lastValue int64 = 0
+			for i := 0; i < 3; i++ {
+				testutils.SucceedsSoon(t, func() error {
+					value := sliA.MaxBehindNanos.Value()
+					if value != lastValue {
+						lastValue = value
+						return nil
+					}
+					return errors.Newf("waiting for max_behind_nanos to update %d",
+						lastValue)
+				})
+			}
+
 			sliB, err := registry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics("label_b")
 			require.Equal(t, int64(0), sliB.AggregatorProgress.Value())
 			fooB := feed(t, f, `CREATE CHANGEFEED FOR foo WITH metrics_label='label_b', resolved='100ms'`)
@@ -450,7 +567,8 @@ func TestChangefeedProgressMetrics(t *testing.T) {
 			testutils.SucceedsSoon(t, func() error {
 				aggregatorProgress := sliA.AggregatorProgress.Value()
 				checkpointProgress := sliA.CheckpointProgress.Value()
-				if aggregatorProgress == 0 && checkpointProgress == 0 {
+				maxBehindNanos := sliA.MaxBehindNanos.Value()
+				if aggregatorProgress == 0 && checkpointProgress == 0 && maxBehindNanos == 0 {
 					return nil
 				}
 				return errors.Newf("waiting for progress metrics to be 0 (ap=%d, cp=%d)",
@@ -471,13 +589,33 @@ func TestChangefeedIdleness(t *testing.T) {
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
 		currentlyIdle := registry.MetricsStruct().JobMetrics[jobspb.TypeChangefeed].CurrentlyIdle
+		// Use a wait group for cases when the number of idle changefeeds temporarily
+		// decreases, to avoid a race condition where the changefeed becomes idle
+		// before the idleness is checked.
+		var wg sync.WaitGroup
 		waitForIdleCount := func(numIdle int64) {
+			wg.Add(1)
 			testutils.SucceedsSoon(t, func() error {
 				if currentlyIdle.Value() != numIdle {
 					return fmt.Errorf("expected (%+v) idle changefeeds, found (%+v)", numIdle, currentlyIdle.Value())
 				}
 				return nil
 			})
+			wg.Done()
+		}
+		done := make(chan bool)
+		workload := func() {
+			for {
+				select {
+				case <-done:
+					return
+				default:
+					sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
+					sqlDB.Exec(t, `DELETE FROM foo WHERE a = 0`)
+					sqlDB.Exec(t, `INSERT INTO bar VALUES (0)`)
+					sqlDB.Exec(t, `DELETE FROM bar WHERE b = 0`)
+				}
+			}
 		}
 
 		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY)`)
@@ -486,9 +624,10 @@ func TestChangefeedIdleness(t *testing.T) {
 		cf2 := feed(t, f, "CREATE CHANGEFEED FOR TABLE bar WITH resolved='10ms'")
 		defer closeFeed(t, cf1)
 
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (0)`)
-		sqlDB.Exec(t, `INSERT INTO bar VALUES (0)`)
-		waitForIdleCount(0)
+		go workload()
+		go waitForIdleCount(0)
+		wg.Wait()
+		done <- true
 		waitForIdleCount(2) // Both should eventually be considered idle
 
 		jobFeed := cf2.(cdctest.EnterpriseTestFeed)
@@ -501,14 +640,12 @@ func TestChangefeedIdleness(t *testing.T) {
 		closeFeed(t, cf2)
 		waitForIdleCount(1) // The cancelled changefeed isn't considered idle
 
-		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
-		waitForIdleCount(0)
+		go workload()
+		go waitForIdleCount(0)
+		wg.Wait()
+		done <- true
 		waitForIdleCount(1)
 
-		assertPayloads(t, cf1, []string{
-			`foo: [0]->{"after": {"a": 0}}`,
-			`foo: [1]->{"after": {"a": 1}}`,
-		})
 	}, feedTestEnterpriseSinks)
 }
 
@@ -1158,7 +1295,6 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 				}
 				continue
 			}
-			numNonTrivialTestRuns++
 			assertedPayloads := make([]string, len(expectedRowIDs))
 			for i, id := range expectedRowIDs {
 				assertedPayloads[i] = fmt.Sprintf(`seed: [%s]->{"rowid": %s}`, id, id)
@@ -1166,12 +1302,26 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false)
 			closeFeedIgnoreError(t, seedFeed)
 			if err != nil {
+				code := pgerror.GetPGCode(err)
+				// Skip errors that may come up during SQL execution. If the SQL query
+				// didn't fail with these errors, it's likely because the query was built in
+				// a way that did not have to execute on the row that caused the error, but
+				// the CDC query did.
+				switch code {
+				case pgcode.ConfigFile,
+					pgcode.DatetimeFieldOverflow,
+					pgcode.InvalidEscapeCharacter,
+					pgcode.InvalidEscapeSequence,
+					pgcode.InvalidParameterValue,
+					pgcode.InvalidRegularExpression:
+					t.Logf("Skipping statement %s because it encountered pgerror %s: %s", createStmt, code, err)
+					continue
+				}
 				t.Fatal(err)
 			}
+			numNonTrivialTestRuns++
 		}
-		if n > 100 {
-			require.Greater(t, numNonTrivialTestRuns, 1)
-		}
+		require.Greater(t, numNonTrivialTestRuns, 1)
 		t.Logf("%d predicates checked: all had the same result in SELECT and CHANGEFEED", numNonTrivialTestRuns)
 
 	}

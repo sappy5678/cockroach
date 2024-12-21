@@ -153,6 +153,9 @@ transaction_stmt ::=
 	| commit_stmt
 	| rollback_stmt
 	| abort_stmt
+	| prepare_transaction_stmt
+	| commit_prepared_stmt
+	| rollback_prepared_stmt
 
 close_cursor_stmt ::=
 	'CLOSE' 'ALL'
@@ -469,6 +472,15 @@ rollback_stmt ::=
 
 abort_stmt ::=
 	'ABORT' opt_abort_mod
+
+prepare_transaction_stmt ::=
+	'PREPARE' 'TRANSACTION' 'SCONST'
+
+commit_prepared_stmt ::=
+	'COMMIT' 'PREPARED' 'SCONST'
+
+rollback_prepared_stmt ::=
+	'ROLLBACK' 'PREPARED' 'SCONST'
 
 cursor_name ::=
 	name
@@ -1069,6 +1081,7 @@ unreserved_keyword ::=
 	| 'BUCKET_COUNT'
 	| 'BUNDLE'
 	| 'BY'
+	| 'BYPASSRLS'
 	| 'CACHE'
 	| 'CALL'
 	| 'CALLED'
@@ -1129,11 +1142,13 @@ unreserved_keyword ::=
 	| 'DESTINATION'
 	| 'DETACHED'
 	| 'DETAILS'
+	| 'DISABLE'
 	| 'DISCARD'
 	| 'DOMAIN'
 	| 'DOUBLE'
 	| 'DROP'
 	| 'EACH'
+	| 'ENABLE'
 	| 'ENCODING'
 	| 'ENCRYPTED'
 	| 'ENCRYPTION_PASSPHRASE'
@@ -1283,6 +1298,7 @@ unreserved_keyword ::=
 	| 'NO_INDEX_JOIN'
 	| 'NO_ZIGZAG_JOIN'
 	| 'NO_FULL_SCAN'
+	| 'NOBYPASSRLS'
 	| 'NOCREATEDB'
 	| 'NOCREATELOGIN'
 	| 'NOCANCELQUERY'
@@ -1325,6 +1341,7 @@ unreserved_keyword ::=
 	| 'PAUSE'
 	| 'PAUSED'
 	| 'PER'
+	| 'PERMISSIVE'
 	| 'PHYSICAL'
 	| 'PLACEMENT'
 	| 'PLAN'
@@ -1332,11 +1349,14 @@ unreserved_keyword ::=
 	| 'POINTM'
 	| 'POINTZ'
 	| 'POINTZM'
+	| 'POLICIES'
+	| 'POLICY'
 	| 'POLYGONM'
 	| 'POLYGONZ'
 	| 'POLYGONZM'
 	| 'PRECEDING'
 	| 'PREPARE'
+	| 'PREPARED'
 	| 'PRESERVE'
 	| 'PRIOR'
 	| 'PRIORITY'
@@ -1377,6 +1397,7 @@ unreserved_keyword ::=
 	| 'RESTORE'
 	| 'RESTRICT'
 	| 'RESTRICTED'
+	| 'RESTRICTIVE'
 	| 'RESUME'
 	| 'RETENTION'
 	| 'RETRY'
@@ -1776,6 +1797,8 @@ create_index_stmt ::=
 	| 'CREATE' opt_unique 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name opt_index_access_method '(' index_params ')' opt_hash_sharded opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 	| 'CREATE' opt_unique 'INVERTED' 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+	| 'CREATE' opt_unique 'VECTOR' 'INDEX' opt_concurrently opt_index_name 'ON' table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+	| 'CREATE' opt_unique 'VECTOR' 'INDEX' opt_concurrently 'IF' 'NOT' 'EXISTS' index_name 'ON' table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 
 create_schema_stmt ::=
 	'CREATE' 'SCHEMA' qualifiable_schema_name
@@ -1810,6 +1833,7 @@ create_sequence_stmt ::=
 
 create_func_stmt ::=
 	'CREATE' opt_or_replace 'FUNCTION' routine_create_name '(' opt_routine_param_with_default_list ')' 'RETURNS' opt_return_set routine_return_type opt_create_routine_opt_list opt_routine_body
+	| 'CREATE' opt_or_replace 'FUNCTION' routine_create_name '(' opt_routine_param_with_default_list ')' 'RETURNS' 'TABLE' '(' table_func_column_list ')' opt_create_routine_opt_list opt_routine_body
 	| 'CREATE' opt_or_replace 'FUNCTION' routine_create_name '(' opt_routine_param_with_default_list ')' opt_create_routine_opt_list opt_routine_body
 
 create_proc_stmt ::=
@@ -2155,7 +2179,8 @@ typename ::=
 	| simple_typename 'ARRAY'
 
 transaction_mode ::=
-	transaction_user_priority
+	transaction_iso_level
+	| transaction_user_priority
 	| transaction_read_mode
 	| as_of_clause
 	| transaction_deferrable_mode
@@ -2616,6 +2641,9 @@ opt_routine_body ::=
 	| 'BEGIN' 'ATOMIC' routine_body_stmt_list 'END'
 	| 
 
+table_func_column_list ::=
+	( table_func_column ) ( ( ',' table_func_column ) )*
+
 trigger_action_time ::=
 	'BEFORE'
 	| 'AFTER'
@@ -2959,6 +2987,9 @@ opt_array_bounds ::=
 	'[' ']'
 	| 
 
+transaction_iso_level ::=
+	'ISOLATION' 'LEVEL' iso_level
+
 transaction_user_priority ::=
 	'PRIORITY' user_priority
 
@@ -3103,6 +3134,8 @@ role_option ::=
 	| subject_clause
 	| 'REPLICATION'
 	| 'NOREPLICATION'
+	| 'BYPASSRLS'
+	| 'NOBYPASSRLS'
 
 include_all_clusters ::=
 	'INCLUDE_ALL_VIRTUAL_CLUSTERS'
@@ -3258,6 +3291,9 @@ routine_return_stmt ::=
 
 routine_body_stmt_list ::=
 	(  ) ( ( routine_body_stmt ';' ) )*
+
+table_func_column ::=
+	param_name routine_param_type
 
 trigger_event ::=
 	'INSERT'
@@ -3483,6 +3519,13 @@ interval_type ::=
 	| 'INTERVAL' interval_qualifier
 	| 'INTERVAL' '(' iconst32 ')'
 
+iso_level ::=
+	'READ' 'UNCOMMITTED'
+	| 'READ' 'COMMITTED'
+	| 'SNAPSHOT'
+	| 'REPEATABLE' 'READ'
+	| 'SERIALIZABLE'
+
 user_priority ::=
 	'LOW'
 	| 'NORMAL'
@@ -3674,6 +3717,9 @@ routine_body_stmt ::=
 	stmt_without_legacy_transaction
 	| routine_return_stmt
 
+param_name ::=
+	type_function_name
+
 trigger_transition ::=
 	transition_is_new transition_is_row opt_as table_alias_name
 
@@ -3723,6 +3769,7 @@ bare_label_keywords ::=
 	| 'BUCKET_COUNT'
 	| 'BUNDLE'
 	| 'BY'
+	| 'BYPASSRLS'
 	| 'CACHE'
 	| 'CALL'
 	| 'CALLED'
@@ -3804,6 +3851,7 @@ bare_label_keywords ::=
 	| 'DESTINATION'
 	| 'DETACHED'
 	| 'DETAILS'
+	| 'DISABLE'
 	| 'DISCARD'
 	| 'DISTINCT'
 	| 'DO'
@@ -3812,6 +3860,7 @@ bare_label_keywords ::=
 	| 'DROP'
 	| 'EACH'
 	| 'ELSE'
+	| 'ENABLE'
 	| 'ENCODING'
 	| 'ENCRYPTED'
 	| 'ENCRYPTION_INFO_DIR'
@@ -3992,6 +4041,7 @@ bare_label_keywords ::=
 	| 'NEW_KMS'
 	| 'NEXT'
 	| 'NO'
+	| 'NOBYPASSRLS'
 	| 'NOCANCELQUERY'
 	| 'NOCONTROLCHANGEFEED'
 	| 'NOCONTROLJOB'
@@ -4047,6 +4097,7 @@ bare_label_keywords ::=
 	| 'PAUSE'
 	| 'PAUSED'
 	| 'PER'
+	| 'PERMISSIVE'
 	| 'PHYSICAL'
 	| 'PLACEMENT'
 	| 'PLACING'
@@ -4056,6 +4107,8 @@ bare_label_keywords ::=
 	| 'POINTM'
 	| 'POINTZ'
 	| 'POINTZM'
+	| 'POLICIES'
+	| 'POLICY'
 	| 'POLYGON'
 	| 'POLYGONM'
 	| 'POLYGONZ'
@@ -4063,6 +4116,7 @@ bare_label_keywords ::=
 	| 'POSITION'
 	| 'PRECEDING'
 	| 'PREPARE'
+	| 'PREPARED'
 	| 'PRESERVE'
 	| 'PRIMARY'
 	| 'PRIOR'
@@ -4106,6 +4160,7 @@ bare_label_keywords ::=
 	| 'RESTORE'
 	| 'RESTRICT'
 	| 'RESTRICTED'
+	| 'RESTRICTIVE'
 	| 'RESUME'
 	| 'RETENTION'
 	| 'RETRY'
@@ -4575,6 +4630,8 @@ index_def ::=
 	| 'UNIQUE' 'INDEX' opt_index_name '(' index_params ')' opt_hash_sharded opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 	| 'INVERTED' 'INDEX' '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 	| 'INVERTED' 'INDEX' name '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+	| 'VECTOR' 'INDEX' '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+	| 'VECTOR' 'INDEX' name '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
 
 like_table_option_list ::=
 	(  ) ( ( 'INCLUDING' like_table_option | 'EXCLUDING' like_table_option ) )*
@@ -4632,9 +4689,6 @@ routine_param_class ::=
 	| 'OUT'
 	| 'INOUT'
 	| 'IN' 'OUT'
-
-param_name ::=
-	type_function_name
 
 opt_float ::=
 	'(' 'ICONST' ')'

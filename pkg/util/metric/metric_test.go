@@ -8,6 +8,7 @@ package metric
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"math"
 	"reflect"
 	"sort"
@@ -126,30 +127,46 @@ func TestCounter(t *testing.T) {
 	testMarshal(t, c, "90")
 }
 
+func TestUniqueCounter(t *testing.T) {
+	c := NewUniqueCounter(emptyMetadata)
+	expected := int64(10_000)
+	for i := int64(0); i < expected; i++ {
+		c.Add([]byte(fmt.Sprintf("test-%d", i)))
+	}
+	// UniqueCounter is an approximation
+	margin := float64(expected) * 0.005
+	actual := c.Count()
+	if math.Abs(float64(actual-expected)) > margin {
+		t.Fatalf("unexpected value: %d", actual)
+	}
+
+	testMarshal(t, c, fmt.Sprintf("%d", actual))
+}
+
 func TestCounterFloat64(t *testing.T) {
-	g := NewCounterFloat64(emptyMetadata)
-	g.UpdateIfHigher(10)
-	if v := g.Count(); v != 10 {
+	c := NewCounterFloat64(emptyMetadata)
+	c.UpdateIfHigher(10)
+	if v := c.Count(); v != 10 {
 		t.Fatalf("unexpected value: %f", v)
 	}
-	testMarshal(t, g, "10")
+	testMarshal(t, c, "10")
 
 	var wg sync.WaitGroup
 	for i := int64(0); i < 10; i++ {
 		wg.Add(1)
-		go func(i int64) { g.Inc(float64(i)); wg.Done() }(i)
+		go func(i int64) { c.Inc(float64(i)); wg.Done() }(i)
 	}
 	wg.Wait()
-	if v := g.Count(); math.Abs(v-55.0) > 0.001 {
+	if v := c.Count(); math.Abs(v-55.0) > 0.001 {
 		t.Fatalf("unexpected value: %g", v)
 	}
 
 	for i := int64(55); i < 65; i++ {
 		wg.Add(1)
-		go func(i int64) { g.UpdateIfHigher(float64(i)); wg.Done() }(i)
+		go func(i int64) { c.UpdateIfHigher(float64(i)); wg.Done() }(i)
 	}
 	wg.Wait()
-	if v := g.Count(); math.Abs(v-64.0) > 0.001 {
+	if v := c.Count(); math.Abs(v-64.0) > 0.001 {
 		t.Fatalf("unexpected value: %g", v)
 	}
 }

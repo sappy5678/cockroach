@@ -40,6 +40,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/storage"
@@ -341,6 +342,11 @@ type Replica struct {
 		msgAppScratchForFlowControl map[roachpb.ReplicaID][]raftpb.Message
 		// Scratch for populating rac2.RaftEvent.ReplicaSateInfo for flowContrlV2.
 		replicaStateScratchForFlowControl map[roachpb.ReplicaID]rac2.ReplicaStateInfo
+
+		// rangefeedCTLagObserver is used to observe the closed timestamp lag of
+		// the replica and generate a signal to potentially nudge or cancel the
+		// rangefeed based on observed lag.
+		rangefeedCTLagObserver *rangeFeedCTLagObserver
 	}
 
 	// localMsgs contains a collection of raftpb.Message that target the local
@@ -1687,6 +1693,15 @@ func (r *Replica) raftLeadSupportStatusRLocked() raft.LeadSupportStatus {
 	return raft.LeadSupportStatus{}
 }
 
+// RACv2Status returns the status of the RACv2 range controller of this replica.
+// Returns an empty struct if there is no RACv2 range controller, i.e. this
+// replica is not the leader or is not running RACv2.
+func (r *Replica) RACv2Status() serverpb.RACStatus {
+	r.raftMu.Lock()
+	defer r.raftMu.Unlock()
+	return r.flowControlV2.StatusRaftMuLocked()
+}
+
 // State returns a copy of the internal state of the Replica, along with some
 // auxiliary information.
 func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
@@ -1705,6 +1720,12 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	ri.ReplicaState = *(protoutil.Clone(&r.shMu.state)).(*kvserverpb.ReplicaState)
+	// TODO(#97613): add a dedicated TruncatedState field to RangeInfo when the
+	// TruncatedState field is removed from ReplicaState. We can't do it right now
+	// because the ReplicaState is embedded into RangeInfo, and this confuses the
+	// proto compiler.
+	ri.TruncatedState = (protoutil.Clone(&r.shMu.raftTruncState)).(*kvserverpb.RaftTruncatedState)
+
 	ri.LastIndex = r.shMu.lastIndexNotDurable
 	ri.NumPending = uint64(r.numPendingProposalsRLocked())
 	ri.RaftLogSize = r.shMu.raftLogSize
@@ -2328,9 +2349,6 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 
 		var mergeCommitted bool
 		switch pushTxnRes.PusheeTxn.Status {
-		case roachpb.PENDING, roachpb.STAGING:
-			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
-				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		case roachpb.COMMITTED:
 			// If PushTxn claims that the transaction committed, then the transaction
 			// definitely committed.
@@ -2385,6 +2403,9 @@ func (r *Replica) maybeWatchForMergeLocked(ctx context.Context) (bool, error) {
 					mergeCommitted = true
 				}
 			}
+		default:
+			log.Fatalf(ctx, "PushTxn returned while merge transaction %s was still %s",
+				intentRes.Intent.Txn.ID.Short(), pushTxnRes.PusheeTxn.Status)
 		}
 		r.raftMu.Lock()
 		r.readOnlyCmdMu.Lock()

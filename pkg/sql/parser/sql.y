@@ -66,6 +66,11 @@ func setErr(sqllex sqlLexer, err error) int {
     return 1
 }
 
+func setErrNoDetails(sqllex sqlLexer, err error) int {
+    sqllex.(*lexer).setErrNoDetails(err)
+    return 1
+}
+
 func unimplementedWithIssue(sqllex sqlLexer, issue int) int {
     sqllex.(*lexer).UnimplementedWithIssue(issue)
     return 1
@@ -646,6 +651,24 @@ func (u *sqlSymUnion) indexInvisibility() tree.IndexInvisibility {
 func (u *sqlSymUnion) dropBehavior() tree.DropBehavior {
     return u.val.(tree.DropBehavior)
 }
+func (u *sqlSymUnion) rlsTableMode() tree.TableRLSMode {
+    return u.val.(tree.TableRLSMode)
+}
+func (u *sqlSymUnion) alterPolicy() tree.AlterPolicy {
+    return u.val.(tree.AlterPolicy)
+}
+func (u *sqlSymUnion) createPolicy() tree.CreatePolicy {
+    return u.val.(tree.CreatePolicy)
+}
+func (u *sqlSymUnion) policyType() tree.PolicyType {
+  return u.val.(tree.PolicyType)
+}
+func (u *sqlSymUnion) policyCommand() tree.PolicyCommand {
+  return u.val.(tree.PolicyCommand)
+}
+func (u *sqlSymUnion) policyExpressions() tree.PolicyExpressions {
+	return u.val.(tree.PolicyExpressions)
+}
 func (u *sqlSymUnion) validationBehavior() tree.ValidationBehavior {
     return u.val.(tree.ValidationBehavior)
 }
@@ -914,6 +937,9 @@ func (u *sqlSymUnion) triggerTransitions() []*tree.TriggerTransition {
 func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
   return u.val.(tree.TriggerForEach)
 }
+func (u *sqlSymUnion) indexType() tree.IndexType {
+  return u.val.(tree.IndexType)
+}
 %}
 
 // NB: the %token definitions must come before the %type definitions in this
@@ -939,7 +965,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 
 %token <str> BACKUP BACKUPS BACKWARD BATCH BEFORE BEGIN BETWEEN BIGINT BIGSERIAL BINARY BIT
 %token <str> BUCKET_COUNT
-%token <str> BOOLEAN BOTH BOX2D BUNDLE BY
+%token <str> BOOLEAN BOTH BOX2D BUNDLE BY BYPASSRLS
 
 %token <str> CACHE CALL CALLED CANCEL CANCELQUERY CAPABILITIES CAPABILITY CASCADE CASE CAST CBRT CHANGEFEED CHAR
 %token <str> CHARACTER CHARACTERISTICS CHECK CHECK_FILES CLOSE
@@ -953,9 +979,9 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 
 %token <str> DATA DATABASE DATABASES DATE DAY DEBUG_IDS DEC DEBUG_DUMP_METADATA_SST DECIMAL DEFAULT DEFAULTS DEFINER
 %token <str> DEALLOCATE DECLARE DEFERRABLE DEFERRED DELETE DELIMITER DEPENDS DESC DESTINATION DETACHED DETAILS
-%token <str> DISCARD DISTANCE DISTINCT DO DOMAIN DOUBLE DROP
+%token <str> DISABLE DISCARD DISTANCE DISTINCT DO DOMAIN DOUBLE DROP
 
-%token <str> EACH ELSE ENCODING ENCRYPTED ENCRYPTION_INFO_DIR ENCRYPTION_PASSPHRASE END ENUM ENUMS ESCAPE EXCEPT EXCLUDE EXCLUDING
+%token <str> EACH ELSE ENABLE ENCODING ENCRYPTED ENCRYPTION_INFO_DIR ENCRYPTION_PASSPHRASE END ENUM ENUMS ESCAPE EXCEPT EXCLUDE EXCLUDING
 %token <str> EXISTS EXECUTE EXECUTION EXPERIMENTAL
 %token <str> EXPERIMENTAL_FINGERPRINTS EXPERIMENTAL_REPLICA
 %token <str> EXPERIMENTAL_AUDIT EXPERIMENTAL_RELOCATE
@@ -996,7 +1022,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %token <str> MULTIPOINT MULTIPOINTM MULTIPOINTZ MULTIPOINTZM
 %token <str> MULTIPOLYGON MULTIPOLYGONM MULTIPOLYGONZ MULTIPOLYGONZM
 
-%token <str> NAN NAME NAMES NATURAL NEG_INNER_PRODUCT NEVER NEW NEW_DB_NAME NEW_KMS NEXT NO NOCANCELQUERY NOCONTROLCHANGEFEED
+%token <str> NAN NAME NAMES NATURAL NEG_INNER_PRODUCT NEVER NEW NEW_DB_NAME NEW_KMS NEXT NO NOBYPASSRLS NOCANCELQUERY NOCONTROLCHANGEFEED
 %token <str> NOCONTROLJOB NOCREATEDB NOCREATELOGIN NOCREATEROLE NODE NOLOGIN NOMODIFYCLUSTERSETTING NOREPLICATION
 %token <str> NOSQLLOGIN NO_INDEX_JOIN NO_ZIGZAG_JOIN NO_FULL_SCAN NONE NONVOTERS NORMAL NOT
 %token <str> NOTHING NOTHING_AFTER_RETURNING
@@ -1006,9 +1032,9 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %token <str> OF OFF OFFSET OID OIDS OIDVECTOR OLD OLD_KMS ON ONLY OPT OPTION OPTIONS OR
 %token <str> ORDER ORDINALITY OTHERS OUT OUTER OVER OVERLAPS OVERLAY OWNED OWNER OPERATOR
 
-%token <str> PARALLEL PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PAUSED PER PHYSICAL PLACEMENT PLACING
-%token <str> PLAN PLANS POINT POINTM POINTZ POINTZM POLYGON POLYGONM POLYGONZ POLYGONZM
-%token <str> POSITION PRECEDING PRECISION PREPARE PRESERVE PRIMARY PRIOR PRIORITY PRIVILEGES
+%token <str> PARALLEL PARENT PARTIAL PARTITION PARTITIONS PASSWORD PAUSE PAUSED PER PERMISSIVE PHYSICAL PLACEMENT PLACING
+%token <str> PLAN PLANS POINT POINTM POINTZ POINTZM POLICIES POLICY POLYGON POLYGONM POLYGONZ POLYGONZM
+%token <str> POSITION PRECEDING PRECISION PREPARE PREPARED PRESERVE PRIMARY PRIOR PRIORITY PRIVILEGES
 %token <str> PROCEDURAL PROCEDURE PROCEDURES PUBLIC PUBLICATION
 
 %token <str> QUERIES QUERY QUOTE
@@ -1016,7 +1042,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %token <str> RANGE RANGES READ REAL REASON REASSIGN RECURSIVE RECURRING REDACT REF REFERENCES REFERENCING REFRESH
 %token <str> REGCLASS REGION REGIONAL REGIONS REGNAMESPACE REGPROC REGPROCEDURE REGROLE REGTYPE REINDEX
 %token <str> RELATIVE RELOCATE REMOVE_PATH REMOVE_REGIONS RENAME REPEATABLE REPLACE REPLICATED REPLICATION
-%token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESUME RETENTION RETURNING RETURN RETURNS RETRY REVISION_HISTORY
+%token <str> RELEASE RESET RESTART RESTORE RESTRICT RESTRICTED RESTRICTIVE RESUME RETENTION RETURNING RETURN RETURNS RETRY REVISION_HISTORY
 %token <str> REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP ROUTINES ROW ROWS RSHIFT RULE RUNNING
 
 %token <str> SAVEPOINT SCANS SCATTER SCHEDULE SCHEDULES SCROLL SCHEMA SCHEMA_ONLY SCHEMAS SCRUB
@@ -1098,6 +1124,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> alter_unsupported_stmt
 %type <tree.Statement> alter_func_stmt
 %type <tree.Statement> alter_proc_stmt
+%type <tree.Statement> alter_policy_stmt
 
 // ALTER RANGE
 %type <tree.Statement> alter_zone_range_stmt
@@ -1234,6 +1261,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> create_func_stmt
 %type <tree.Statement> create_proc_stmt
 %type <tree.Statement> create_trigger_stmt
+%type <tree.Statement> create_policy_stmt
 
 %type <tree.LogicalReplicationResources> logical_replication_resources, logical_replication_resources_list
 %type <*tree.LogicalReplicationOptions> opt_logical_replication_options logical_replication_options logical_replication_options_list
@@ -1259,6 +1287,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> drop_view_stmt
 %type <tree.Statement> drop_sequence_stmt
 %type <tree.Statement> drop_func_stmt
+%type <tree.Statement> drop_policy_stmt
 %type <tree.Statement> drop_proc_stmt
 %type <tree.Statement> drop_trigger_stmt
 %type <tree.Statement> drop_virtual_cluster_stmt
@@ -1293,6 +1322,9 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> abort_stmt
 %type <tree.Statement> rollback_stmt
 %type <tree.Statement> savepoint_stmt
+%type <tree.Statement> prepare_transaction_stmt
+%type <tree.Statement> commit_prepared_stmt
+%type <tree.Statement> rollback_prepared_stmt
 
 %type <tree.Statement> preparable_set_stmt nonpreparable_set_stmt
 %type <tree.Statement> set_local_stmt
@@ -1357,6 +1389,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.Statement> show_full_scans_stmt
 %type <tree.Statement> show_completions_stmt
 %type <tree.Statement> show_logical_replication_jobs_stmt opt_show_logical_replication_jobs_options show_logical_replication_jobs_options
+%type <tree.Statement> show_policies_stmt
 
 %type <str> statements_or_queries
 
@@ -1500,6 +1533,7 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <[]*tree.Order> sortby_list sortby_no_index_list
 %type <tree.IndexElemList> index_params create_as_params
 %type <tree.IndexInvisibility> opt_index_visible alter_index_visible
+%type <tree.IndexType> opt_index_access_method
 %type <tree.NameList> name_list privilege_list
 %type <[]int32> opt_array_bounds
 %type <*tree.Batch> opt_batch_clause
@@ -1551,7 +1585,6 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <*tree.TenantSpec> virtual_cluster_spec virtual_cluster_spec_opt_all
 
 %type <bool> opt_unique opt_concurrently opt_cluster opt_without_index
-%type <bool> opt_index_access_method
 
 %type <*tree.Limit> limit_clause offset_clause opt_limit_clause
 %type <tree.Expr> select_fetch_first_value
@@ -1718,14 +1751,20 @@ func (u *sqlSymUnion) triggerForEach() tree.TriggerForEach {
 %type <tree.AbbreviatedRevoke> abbreviated_revoke_stmt
 %type <bool> opt_with_grant_option
 %type <tree.NameList> opt_for_roles
+%type <tree.NameList> opt_policy_roles
+%type <tree.PolicyExpressions> opt_policy_exprs
+%type <tree.PolicyType> opt_policy_type
+%type <tree.PolicyCommand> opt_policy_command
+%type <tree.TableRLSMode> table_rls_mode
 %type <tree.ObjectNamePrefixList>  opt_in_schemas
 %type <privilege.TargetObjectType> target_object_type
 
 // Routine (UDF/SP) relevant components.
-%type <bool> opt_or_replace opt_return_table opt_return_set opt_no
+%type <bool> opt_or_replace opt_return_set opt_no
 %type <str> param_name routine_as
-%type <tree.RoutineParams> opt_routine_param_with_default_list routine_param_with_default_list func_params func_params_list
-%type <tree.RoutineParam> routine_param_with_default routine_param
+%type <tree.RoutineParams> opt_routine_param_with_default_list routine_param_with_default_list
+%type <tree.RoutineParams> func_params func_params_list table_func_column_list
+%type <tree.RoutineParam> routine_param_with_default routine_param table_func_column
 %type <tree.ResolvableTypeReference> routine_return_type routine_param_type
 %type <tree.RoutineOptions> opt_create_routine_opt_list create_routine_opt_list alter_func_opt_list
 %type <tree.RoutineOption> create_routine_opt_item common_routine_opt_item
@@ -1892,6 +1931,7 @@ alter_ddl_stmt:
 | alter_func_stmt               // EXTEND WITH HELP: ALTER FUNCTION
 | alter_proc_stmt               // EXTEND WITH HELP: ALTER PROCEDURE
 | alter_backup_schedule  // EXTEND WITH HELP: ALTER BACKUP SCHEDULE
+| alter_policy_stmt             // EXTEND WITH HELP: ALTER POLICY
 
 // %Help: ALTER TABLE - change the definition of a table
 // %Category: DDL
@@ -1929,6 +1969,7 @@ alter_ddl_stmt:
 //   ALTER TABLE ... CONFIGURE ZONE <zoneconfig>
 //   ALTER TABLE ... SET SCHEMA <newschemaname>
 //   ALTER TABLE ... SET LOCALITY [REGIONAL BY [TABLE IN <region> | ROW] | GLOBAL]
+//   ALTER TABLE ... {ENABLE | DISABLE | FORCE | NO FORCE} ROW LEVEL SECURITY
 //
 // Column qualifiers:
 //   [CONSTRAINT <constraintname>] {NULL | NOT NULL | UNIQUE | PRIMARY KEY | CHECK (<expr>) | DEFAULT <expr>}
@@ -2998,6 +3039,13 @@ alter_table_cmd:
   {
     $$.val = &tree.AlterTableResetStorageParams{
       Params: $3.storageParamKeys(),
+    }
+  }
+| table_rls_mode ROW LEVEL SECURITY
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterTableSetRLSMode{
+      Mode: $1.rlsTableMode(),
     }
   }
 
@@ -4732,39 +4780,39 @@ logical_replication_options:
 // CREATE VIRTUAL CLUSTER [ IF NOT EXISTS ] name [ <replication> ]
 //
 // Replication option:
-//    FROM REPLICATION OF <virtual_cluster_spec> ON <location> [ WITH OPTIONS ... ]
+//    FROM REPLICATION OF name ON <location> [ WITH OPTIONS ... ]
 create_virtual_cluster_stmt:
-  CREATE virtual_cluster d_expr
+  CREATE virtual_cluster virtual_cluster_spec
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
+      TenantSpec: $3.tenantSpec(),
     }
   }
-| CREATE virtual_cluster IF NOT EXISTS d_expr
+| CREATE virtual_cluster IF NOT EXISTS virtual_cluster_spec
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenant{
       IfNotExists: true,
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $6.expr()},
+      TenantSpec: $6.tenantSpec(),
     }
   }
-| CREATE virtual_cluster d_expr FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
+| CREATE virtual_cluster virtual_cluster_spec FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $3.expr()},
+      TenantSpec: $3.tenantSpec(),
       ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $7.expr()},
       ReplicationSourceAddress: $9.expr(),
       Options: *$10.tenantReplicationOptions(),
     }
   }
-| CREATE virtual_cluster IF NOT EXISTS d_expr FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
+| CREATE virtual_cluster IF NOT EXISTS virtual_cluster_spec FROM REPLICATION OF d_expr ON d_expr opt_with_replication_options
   {
     /* SKIP DOC */
     $$.val = &tree.CreateTenantFromReplication{
       IfNotExists: true,
-      TenantSpec: &tree.TenantSpec{IsName: true, Expr: $6.expr()},
+      TenantSpec: $6.tenantSpec(),
       ReplicationSourceTenantName: &tree.TenantSpec{IsName: true, Expr: $10.expr()},
       ReplicationSourceAddress: $12.expr(),
       Options: *$13.tenantReplicationOptions(),
@@ -4850,6 +4898,192 @@ create_extension_stmt:
   }
 | CREATE EXTENSION error // SHOW HELP: CREATE EXTENSION
 
+// %Help: ALTER POLICY - alter an existing row-level security policy
+// %Category: DDL
+// %Text:
+// ALTER POLICY name ON table_name RENAME TO new_policy_name
+//
+// ALTER POLICY name ON table_name
+//       [ TO { role_name | PUBLIC | CURRENT_USER | SESSION_USER } [, ...] ]
+//       [ USING ( using_expression ) ]
+//       [ WITH CHECK ( check_expression ) ]
+//
+// %SeeAlso: CREATE POLICY, DROP POLICY
+alter_policy_stmt:
+  ALTER POLICY name ON table_name RENAME TO name
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterPolicy{
+      PolicyName: tree.Name($3),
+      TableName: $5.unresolvedObjectName().ToTableName(),
+      NewPolicyName: tree.Name($8),
+    }
+  }
+| ALTER POLICY name ON table_name opt_policy_roles opt_policy_exprs
+  {
+    /* SKIP DOC */
+    $$.val = &tree.AlterPolicy{
+      PolicyName: tree.Name($3),
+      TableName: $5.unresolvedObjectName().ToTableName(),
+      Roles: $6.roleSpecList(),
+      Exprs: $7.policyExpressions(),
+    }
+  }
+| ALTER POLICY error // SHOW HELP: ALTER POLICY
+
+// %Help: CREATE POLICY - define a new row-level security policy for a table
+// %Category: DDL
+// %Text:
+// CREATE POLICY name ON table_name
+//     [ AS { PERMISSIVE | RESTRICTIVE } ]
+//     [ FOR { ALL | SELECT | INSERT | UPDATE | DELETE } ]
+//     [ TO { role_name | PUBLIC | CURRENT_USER | SESSION_USER } [, ...] ]
+//     [ USING ( using_expression ) ]
+//     [ WITH CHECK ( check_expression ) ]
+//
+// %SeeAlso: ALTER POLICY, DROP POLICY
+create_policy_stmt:
+  CREATE POLICY name ON table_name opt_policy_type opt_policy_command opt_policy_roles opt_policy_exprs
+  {
+    /* SKIP DOC */
+    $$.val = &tree.CreatePolicy{
+      PolicyName: tree.Name($3),
+      TableName: $5.unresolvedObjectName().ToTableName(),
+      Type: $6.policyType(),
+      Cmd: $7.policyCommand(),
+      Roles: $8.roleSpecList(),
+      Exprs: $9.policyExpressions(),
+    }
+  }
+ | CREATE POLICY error // SHOW HELP: CREATE POLICY
+
+// %Help: DROP POLICY - remove an existing row-level security policy from a table
+// %Category: DDL
+// %Text:
+// DROP POLICY [ IF EXISTS ] name ON table_name [ CASCADE | RESTRICT ]
+//
+// %SeeAlso: CREATE POLICY, ALTER POLICY
+drop_policy_stmt:
+  DROP POLICY name ON table_name opt_drop_behavior
+  {
+    /* SKIP DOC */
+    $$.val = &tree.DropPolicy{
+      PolicyName: tree.Name($3),
+      TableName: $5.unresolvedObjectName(),
+      DropBehavior: $6.dropBehavior(),
+      IfExists: false,
+    }
+  }
+| DROP POLICY IF EXISTS name ON table_name opt_drop_behavior
+  {
+    /* SKIP DOC */
+    $$.val = &tree.DropPolicy{
+      PolicyName: tree.Name($5),
+      TableName: $7.unresolvedObjectName(),
+      DropBehavior: $8.dropBehavior(),
+      IfExists: true,
+    }
+  }
+| DROP POLICY error // SHOW HELP: DROP POLICY
+
+opt_policy_type:
+  AS PERMISSIVE
+  {
+    $$.val = tree.PolicyTypePermissive
+  }
+| AS RESTRICTIVE
+  {
+    $$.val = tree.PolicyTypeRestrictive
+  }
+| /* EMPTY */
+  {
+    $$.val = tree.PolicyTypeDefault
+  }
+
+opt_policy_command:
+  FOR ALL
+  {
+    $$.val = tree.PolicyCommandAll
+  }
+| FOR SELECT
+  {
+    $$.val = tree.PolicyCommandSelect
+  }
+| FOR INSERT
+  {
+    $$.val = tree.PolicyCommandInsert
+  }
+| FOR UPDATE
+  {
+    $$.val = tree.PolicyCommandUpdate
+  }
+| FOR DELETE
+  {
+    $$.val = tree.PolicyCommandDelete
+  }
+| /* EMPTY */
+  {
+    $$.val = tree.PolicyCommandDefault
+  }
+
+opt_policy_roles:
+ TO role_spec_list
+ {
+   $$.val = $2.roleSpecList()
+ }
+| /* EMPTY */ {
+   $$.val = tree.RoleSpecList(nil)
+}
+
+opt_policy_exprs:
+  USING '(' a_expr ')' WITH CHECK '(' a_expr ')'
+  {
+    $$.val = tree.PolicyExpressions{
+      Using: $3.expr(),
+      WithCheck: $8.expr(),
+    }
+  }
+| WITH CHECK '(' a_expr ')' USING '(' a_expr ')'
+  {
+    $$.val = tree.PolicyExpressions{
+      Using: $8.expr(),
+      WithCheck: $4.expr(),
+    }
+  }
+| WITH CHECK '(' a_expr ')'
+  {
+    $$.val = tree.PolicyExpressions{
+      WithCheck: $4.expr(),
+    }
+ 	}
+| USING '(' a_expr ')'
+  {
+    $$.val = tree.PolicyExpressions{
+      Using: $3.expr(),
+    }
+ 	}
+| /* EMPTY */ {
+   $$.val = tree.PolicyExpressions{}
+}
+
+table_rls_mode:
+  ENABLE
+  {
+    $$.val = tree.TableRLSEnable
+  }
+| DISABLE
+  {
+    $$.val = tree.TableRLSDisable
+  }
+| FORCE
+  {
+    $$.val = tree.TableRLSForce
+  }
+| NO FORCE
+  {
+    $$.val = tree.TableRLSNoForce
+  }
+
 // %Help: CREATE FUNCTION - define a new function
 // %Category: DDL
 // %Text:
@@ -4866,8 +5100,7 @@ create_extension_stmt:
 // %SeeAlso: WEBDOCS/create-function.html
 create_func_stmt:
   CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
-  RETURNS opt_return_table opt_return_set routine_return_type
-  opt_create_routine_opt_list opt_routine_body
+  RETURNS opt_return_set routine_return_type opt_create_routine_opt_list opt_routine_body
   {
     name := $4.unresolvedObjectName().ToRoutineName()
     $$.val = &tree.CreateRoutine{
@@ -4876,11 +5109,43 @@ create_func_stmt:
       Name: name,
       Params: $6.routineParams(),
       ReturnType: &tree.RoutineReturnType{
-        Type: $11.typeReference(),
-        SetOf: $10.bool(),
+        Type: $10.typeReference(),
+        SetOf: $9.bool(),
       },
-      Options: $12.routineOptions(),
-      RoutineBody: $13.routineBody(),
+      Options: $11.routineOptions(),
+      RoutineBody: $12.routineBody(),
+    }
+  }
+| CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
+  RETURNS TABLE '(' table_func_column_list ')' opt_create_routine_opt_list opt_routine_body
+  {
+    // RETURNS TABLE is syntactic sugar for RETURNS SETOF with:
+    // - RECORD if there are multiple TABLE parameters, or
+    // - the type of the single TABLE parameter.
+    // The TABLE parameters are added to the list of routine parameters.
+    tableParams := $11.routineParams()
+    returnType := tree.ResolvableTypeReference(types.AnyTuple)
+    if len(tableParams) == 1 {
+      returnType = tableParams[0].Type
+    }
+    routineParams := $6.routineParams()
+    for i := range routineParams {
+      // OUT parameters are not allowed in table functions.
+      if tree.IsOutParamClass(routineParams[i].Class) {
+        return setErrNoDetails(sqllex, errors.New("OUT and INOUT arguments aren't allowed in TABLE functions"))
+      }
+    }
+    $$.val = &tree.CreateRoutine{
+      IsProcedure: false,
+      Replace: $2.bool(),
+      Name: $4.unresolvedObjectName().ToRoutineName(),
+      Params: append(routineParams, tableParams...),
+      ReturnType: &tree.RoutineReturnType{
+        Type: returnType,
+        SetOf: true,
+      },
+      Options: $13.routineOptions(),
+      RoutineBody: $14.routineBody(),
     }
   }
 | CREATE opt_or_replace FUNCTION routine_create_name '(' opt_routine_param_with_default_list ')'
@@ -4927,10 +5192,6 @@ create_proc_stmt:
 
 opt_or_replace:
   OR REPLACE { $$.val = true }
-| /* EMPTY */ { $$.val = false }
-
-opt_return_table:
-  TABLE { return unimplementedWithIssueDetail(sqllex, 100226, "UDF returning TABLE") }
 | /* EMPTY */ { $$.val = false }
 
 opt_return_set:
@@ -5018,6 +5279,25 @@ routine_param_type:
 
 routine_return_type:
   routine_param_type
+
+table_func_column: param_name routine_param_type
+  {
+    $$.val = tree.RoutineParam{
+      Name: tree.Name($1),
+      Type: $2.typeReference(),
+      Class: tree.RoutineParamOut,
+    }
+  }
+
+table_func_column_list:
+  table_func_column
+  {
+    $$.val = tree.RoutineParams{$1.routineParam()}
+  }
+| table_func_column_list ',' table_func_column
+  {
+    $$.val = append($1.routineParams(), $3.routineParam())
+  }
 
 opt_create_routine_opt_list:
   create_routine_opt_list { $$.val = $1.routineOptions() }
@@ -5634,6 +5914,7 @@ create_ddl_stmt:
 | create_func_stmt     // EXTEND WITH HELP: CREATE FUNCTION
 | create_proc_stmt     // EXTEND WITH HELP: CREATE PROCEDURE
 | create_trigger_stmt  // EXTEND WITH HELP: CREATE TRIGGER
+| create_policy_stmt   // EXTEND WITH HELP: CREATE POLICY
 
 // %Help: CREATE STATISTICS - create a new table statistic
 // %Category: Misc
@@ -6021,6 +6302,7 @@ drop_ddl_stmt:
 | drop_func_stmt     // EXTEND WITH HELP: DROP FUNCTION
 | drop_proc_stmt     // EXTEND WITH HELP: DROP FUNCTION
 | drop_trigger_stmt  // EXTEND WITH HELP: DROP TRIGGER
+| drop_policy_stmt   // EXTEND WITH HELP: DROP POLICY
 
 // %Help: DROP VIEW - remove a view
 // %Category: DDL
@@ -7860,6 +8142,7 @@ show_stmt:
 | show_users_stmt            // EXTEND WITH HELP: SHOW USERS
 | show_default_session_variables_for_role_stmt // EXTEND WITH HELP: SHOW DEFAULT SESSION VARIABLES FOR ROLE
 | show_zone_stmt             // EXTEND WITH HELP: SHOW ZONE CONFIGURATION
+| show_policies_stmt         // EXTEND WITH HELP: SHOW POLICIES
 | SHOW error                 // SHOW HELP: SHOW
 | show_last_query_stats_stmt
 | show_full_scans_stmt
@@ -9111,6 +9394,19 @@ show_completions_stmt:
     }
   }
 
+// %Help: SHOW POLICIES - list row-level security policies defined for a table
+// %Category: DDL
+// %Text: SHOW POLICIES FOR <table_name>
+show_policies_stmt:
+  SHOW POLICIES FOR table_name
+  {
+    /* SKIP DOC */
+    $$.val = &tree.ShowPolicies{
+      Table: $4.unresolvedObjectName(),
+    }
+  }
+| SHOW POLICIES error // SHOW HELP: SHOW POLICIES
+
 show_last_query_stats_stmt:
   SHOW LAST QUERY STATISTICS query_stats_cols
   {
@@ -10158,7 +10454,7 @@ alter_schema_stmt:
 //
 // Table elements:
 //    <name> <type> [<qualifiers...>]
-//    [UNIQUE | INVERTED] INDEX [<name>] ( <colname> [ASC | DESC] [, ...] )
+//    [UNIQUE | INVERTED | VECTOR] INDEX [<name>] ( <colname> [ASC | DESC] [, ...] )
 //                            [USING HASH] [{STORING | INCLUDE | COVERING} ( <colnames...> )]
 //    FAMILY [<name>] ( <colnames...> )
 //    [CONSTRAINT <name>] <constraint>
@@ -10809,6 +11105,30 @@ index_def:
       Name:             tree.Name($3),
       Columns:          $5.idxElems(),
       Inverted:         true,
+      PartitionByIndex: $7.partitionByIndex(),
+      StorageParams:    $8.storageParams(),
+      Predicate:        $9.expr(),
+      Invisibility:     $10.indexInvisibility(),
+    }
+  }
+| VECTOR INDEX_BEFORE_PAREN '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+  {
+    $$.val = &tree.IndexTableDef{
+      Name:             "",
+      Columns:          $4.idxElems(),
+      Vector:           true,
+      PartitionByIndex: $6.partitionByIndex(),
+      StorageParams:    $7.storageParams(),
+      Predicate:        $8.expr(),
+      Invisibility:     $9.indexInvisibility(),
+    }
+  }
+| VECTOR INDEX_BEFORE_NAME_THEN_PAREN name '(' index_params ')' opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+  {
+    $$.val = &tree.IndexTableDef{
+      Name:             tree.Name($3),
+      Columns:          $5.idxElems(),
+      Vector:           true,
       PartitionByIndex: $7.partitionByIndex(),
       StorageParams:    $8.storageParams(),
       Predicate:        $9.expr(),
@@ -11565,6 +11885,14 @@ role_option:
   {
     $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
   }
+| BYPASSRLS
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
+| NOBYPASSRLS
+  {
+    $$.val = tree.KVOption{Key: tree.Name($1), Value: nil}
+  }
 
 role_options:
   role_option
@@ -11714,7 +12042,7 @@ composite_type_list:
 // %Help: CREATE INDEX - create a new index
 // %Category: DDL
 // %Text:
-// CREATE [UNIQUE | INVERTED] INDEX [CONCURRENTLY] [IF NOT EXISTS] [<idxname>]
+// CREATE [UNIQUE | INVERTED | VECTOR] INDEX [CONCURRENTLY] [IF NOT EXISTS] [<idxname>]
 //        ON <tablename> ( <colname> [ASC | DESC] [, ...] )
 //        [USING HASH] [STORING ( <colnames...> )]
 //        [PARTITION BY <partition params>]
@@ -11726,6 +12054,7 @@ create_index_stmt:
   CREATE opt_unique INDEX opt_concurrently opt_index_name ON table_name opt_index_access_method '(' index_params ')' opt_hash_sharded opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
   {
     table := $7.unresolvedObjectName().ToTableName()
+    indexType := $8.indexType()
     $$.val = &tree.CreateIndex{
       Name:             tree.Name($5),
       Table:            table,
@@ -11736,7 +12065,8 @@ create_index_stmt:
       PartitionByIndex: $14.partitionByIndex(),
       StorageParams:    $15.storageParams(),
       Predicate:        $16.expr(),
-      Inverted:         $8.bool(),
+      Inverted:         indexType == tree.IndexTypeInverted,
+      Vector:           indexType == tree.IndexTypeVector,
       Concurrently:     $4.bool(),
       Invisibility:     $17.indexInvisibility(),
     }
@@ -11744,6 +12074,7 @@ create_index_stmt:
 | CREATE opt_unique INDEX opt_concurrently IF NOT EXISTS index_name ON table_name opt_index_access_method '(' index_params ')' opt_hash_sharded opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
   {
     table := $10.unresolvedObjectName().ToTableName()
+    indexType := $11.indexType()
     $$.val = &tree.CreateIndex{
       Name:             tree.Name($8),
       Table:            table,
@@ -11753,7 +12084,8 @@ create_index_stmt:
       Sharded:          $15.shardedIndexDef(),
       Storing:          $16.nameList(),
       PartitionByIndex: $17.partitionByIndex(),
-      Inverted:         $11.bool(),
+      Inverted:         indexType == tree.IndexTypeInverted,
+      Vector:           indexType == tree.IndexTypeVector,
       StorageParams:    $18.storageParams(),
       Predicate:        $19.expr(),
       Concurrently:     $4.bool(),
@@ -11795,27 +12127,66 @@ create_index_stmt:
       Invisibility:     $19.indexInvisibility(),
     }
   }
+| CREATE opt_unique VECTOR INDEX opt_concurrently opt_index_name ON table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+  {
+    table := $8.unresolvedObjectName().ToTableName()
+    $$.val = &tree.CreateIndex{
+      Name:             tree.Name($6),
+      Table:            table,
+      Unique:           $2.bool(),
+      Vector:           true,
+      Columns:          $10.idxElems(),
+      Storing:          $12.nameList(),
+      PartitionByIndex: $13.partitionByIndex(),
+      StorageParams:    $14.storageParams(),
+      Predicate:        $15.expr(),
+      Concurrently:     $5.bool(),
+      Invisibility:     $16.indexInvisibility(),
+    }
+  }
+| CREATE opt_unique VECTOR INDEX opt_concurrently IF NOT EXISTS index_name ON table_name '(' index_params ')' opt_storing opt_partition_by_index opt_with_storage_parameter_list opt_where_clause opt_index_visible
+  {
+    table := $11.unresolvedObjectName().ToTableName()
+    $$.val = &tree.CreateIndex{
+      Name:             tree.Name($9),
+      Table:            table,
+      Unique:           $2.bool(),
+      Vector:           true,
+      IfNotExists:      true,
+      Columns:          $13.idxElems(),
+      Storing:          $15.nameList(),
+      PartitionByIndex: $16.partitionByIndex(),
+      StorageParams:    $17.storageParams(),
+      Predicate:        $18.expr(),
+      Concurrently:     $5.bool(),
+      Invisibility:     $19.indexInvisibility(),
+    }
+  }
 | CREATE opt_unique INDEX error // SHOW HELP: CREATE INDEX
 
 opt_index_access_method:
   USING name
   {
     /* FORCE DOC */
+    var val tree.IndexType
     switch $2 {
       case "gin", "gist":
-        $$.val = true
+        val = tree.IndexTypeInverted
       case "btree":
-        $$.val = false
+        val = tree.IndexTypeForward
+      case "cspann":
+        val = tree.IndexTypeVector
       case "hash", "spgist", "brin":
         return unimplemented(sqllex, "index using " + $2)
       default:
         sqllex.Error("unrecognized access method: " + $2)
         return 1
     }
+    $$.val = val
   }
 | /* EMPTY */
   {
-    $$.val = false
+    $$.val = tree.IndexTypeForward
   }
 
 opt_concurrently:
@@ -12501,12 +12872,15 @@ savepoint_stmt:
   }
 | SAVEPOINT error // SHOW HELP: SAVEPOINT
 
-// BEGIN / START / COMMIT / END / ROLLBACK / ...
+// BEGIN / START / COMMIT / END / ROLLBACK / PREPARE TRANSACTION / COMMIT PREPARED / ROLLBACK PREPARED / ...
 transaction_stmt:
-  begin_stmt    // EXTEND WITH HELP: BEGIN
-| commit_stmt   // EXTEND WITH HELP: COMMIT
-| rollback_stmt // EXTEND WITH HELP: ROLLBACK
-| abort_stmt    /* SKIP DOC */
+  begin_stmt               // EXTEND WITH HELP: BEGIN
+| commit_stmt              // EXTEND WITH HELP: COMMIT
+| rollback_stmt            // EXTEND WITH HELP: ROLLBACK
+| abort_stmt               /* SKIP DOC */
+| prepare_transaction_stmt // EXTEND WITH HELP: PREPARE TRANSACTION
+| commit_prepared_stmt     // EXTEND WITH HELP: COMMIT PREPARED
+| rollback_prepared_stmt   // EXTEND WITH HELP: ROLLBACK PREPARED
 
 // %Help: BEGIN - start a transaction
 // %Category: Txn
@@ -12641,7 +13015,6 @@ opt_comma:
 transaction_mode:
   transaction_iso_level
   {
-    /* SKIP DOC */
     $$.val = tree.TransactionModes{Isolation: $1.isoLevel()}
   }
 | transaction_user_priority
@@ -12691,6 +13064,36 @@ transaction_deferrable_mode:
 | NOT DEFERRABLE
   {
     $$.val = tree.NotDeferrable
+  }
+
+// %Help: PREPARE TRANSACTION - prepare the current transaction for two-phase commit
+// %Category: Txn
+// %Text: PREPARE TRANSACTION <transaction-id>
+// %SeeAlso: COMMIT PREPARED, ROLLBACK PREPARED
+prepare_transaction_stmt:
+  PREPARE TRANSACTION SCONST
+  {
+    $$.val = &tree.PrepareTransaction{Transaction: tree.NewStrVal($3)}
+  }
+
+// %Help: COMMIT PREPARED - commit the named transaction as part of two-phase commit
+// %Category: Txn
+// %Text: COMMIT PREPARED <transaction-id>
+// %SeeAlso: PREPARE TRANSACTION, ROLLBACK PREPARED
+commit_prepared_stmt:
+  COMMIT PREPARED SCONST
+  {
+    $$.val = &tree.CommitPrepared{Transaction: tree.NewStrVal($3)}
+  }
+
+// %Help: ROLLBACK PREPARED - rollback the named transaction as part of two-phase commit
+// %Category: Txn
+// %Text: ROLLBACK PREPARED <transaction-id>
+// %SeeAlso: PREPARE TRANSACTION, COMMIT PREPARED
+rollback_prepared_stmt:
+  ROLLBACK PREPARED SCONST
+  {
+    $$.val = &tree.RollbackPrepared{Transaction: tree.NewStrVal($3)}
   }
 
 // %Help: CREATE DATABASE - create a new database
@@ -17496,6 +17899,7 @@ unreserved_keyword:
 | BUCKET_COUNT
 | BUNDLE
 | BY
+| BYPASSRLS
 | CACHE
 | CALL
 | CALLED
@@ -17556,11 +17960,13 @@ unreserved_keyword:
 | DESTINATION
 | DETACHED
 | DETAILS
+| DISABLE
 | DISCARD
 | DOMAIN
 | DOUBLE
 | DROP
 | EACH
+| ENABLE
 | ENCODING
 | ENCRYPTED
 | ENCRYPTION_PASSPHRASE
@@ -17710,6 +18116,7 @@ unreserved_keyword:
 | NO_INDEX_JOIN
 | NO_ZIGZAG_JOIN
 | NO_FULL_SCAN
+| NOBYPASSRLS
 | NOCREATEDB
 | NOCREATELOGIN
 | NOCANCELQUERY
@@ -17752,6 +18159,7 @@ unreserved_keyword:
 | PAUSE
 | PAUSED
 | PER
+| PERMISSIVE
 | PHYSICAL
 | PLACEMENT
 | PLAN
@@ -17759,11 +18167,14 @@ unreserved_keyword:
 | POINTM
 | POINTZ
 | POINTZM
+| POLICIES
+| POLICY
 | POLYGONM
 | POLYGONZ
 | POLYGONZM
 | PRECEDING
 | PREPARE
+| PREPARED
 | PRESERVE
 | PRIOR
 | PRIORITY
@@ -17804,6 +18215,7 @@ unreserved_keyword:
 | RESTORE
 | RESTRICT
 | RESTRICTED
+| RESTRICTIVE
 | RESUME
 | RETENTION
 | RETRY
@@ -17994,6 +18406,7 @@ bare_label_keywords:
 | BUCKET_COUNT
 | BUNDLE
 | BY
+| BYPASSRLS
 | CACHE
 | CALL
 | CALLED
@@ -18075,6 +18488,7 @@ bare_label_keywords:
 | DESTINATION
 | DETACHED
 | DETAILS
+| DISABLE
 | DISCARD
 | DISTINCT
 | DO
@@ -18083,6 +18497,7 @@ bare_label_keywords:
 | DROP
 | EACH
 | ELSE
+| ENABLE
 | ENCODING
 | ENCRYPTED
 | ENCRYPTION_INFO_DIR
@@ -18263,6 +18678,7 @@ bare_label_keywords:
 | NEW_KMS
 | NEXT
 | NO
+| NOBYPASSRLS
 | NOCANCELQUERY
 | NOCONTROLCHANGEFEED
 | NOCONTROLJOB
@@ -18318,6 +18734,7 @@ bare_label_keywords:
 | PAUSE
 | PAUSED
 | PER
+| PERMISSIVE
 | PHYSICAL
 | PLACEMENT
 | PLACING
@@ -18327,6 +18744,8 @@ bare_label_keywords:
 | POINTM
 | POINTZ
 | POINTZM
+| POLICIES
+| POLICY
 | POLYGON
 | POLYGONM
 | POLYGONZ
@@ -18334,6 +18753,7 @@ bare_label_keywords:
 | POSITION
 | PRECEDING
 | PREPARE
+| PREPARED
 | PRESERVE
 | PRIMARY
 | PRIOR
@@ -18377,6 +18797,7 @@ bare_label_keywords:
 | RESTORE
 | RESTRICT
 | RESTRICTED
+| RESTRICTIVE
 | RESUME
 | RETENTION
 | RETRY

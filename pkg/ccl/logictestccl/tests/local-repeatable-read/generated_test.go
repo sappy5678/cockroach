@@ -2183,6 +2183,13 @@ func TestRepeatableReadLogic_tuple_local(
 	runLogicTest(t, "tuple_local")
 }
 
+func TestRepeatableReadLogic_two_phase_commit(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "two_phase_commit")
+}
+
 func TestRepeatableReadLogic_txn(
 	t *testing.T,
 ) {
@@ -2447,13 +2454,6 @@ func TestRepeatableReadLogic_update_from(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "update_from")
-}
-
-func TestRepeatableReadLogic_upgrade_skip_version(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "upgrade_skip_version")
 }
 
 func TestRepeatableReadLogic_upsert(

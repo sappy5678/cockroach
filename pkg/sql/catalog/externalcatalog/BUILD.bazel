@@ -31,12 +31,12 @@ go_test(
     embed = [":externalcatalog"],
     deps = [
         "//pkg/base",
-        "//pkg/kv",
         "//pkg/security/securityassets",
         "//pkg/security/securitytest",
         "//pkg/security/username",
         "//pkg/server",
         "//pkg/sql",
+        "//pkg/sql/catalog",
         "//pkg/sql/catalog/descpb",
         "//pkg/sql/catalog/descs",
         "//pkg/sql/catalog/externalcatalog/externalpb",

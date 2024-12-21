@@ -848,7 +848,7 @@ func (ca *changeAggregator) noteResolvedSpan(resolved jobspb.ResolvedSpan) (retu
 		return nil
 	}
 
-	advanced, err := ca.frontier.ForwardResolvedSpan(resolved)
+	advanced, err := ca.frontier.ForwardResolvedSpan(ca.Ctx(), resolved)
 	if err != nil {
 		return err
 	}
@@ -888,7 +888,7 @@ func (ca *changeAggregator) noteResolvedSpan(resolved jobspb.ResolvedSpan) (retu
 	// At a lower frequency we checkpoint specific spans in the job progress
 	// either in backfills or if the highwater mark is excessively lagging behind
 	checkpointSpans := ca.spec.JobID != 0 && /* enterprise changefeed */
-		(resolved.Timestamp.Equal(ca.frontier.BackfillTS()) ||
+		(ca.frontier.InBackfill(resolved) ||
 			ca.frontier.hasLaggingSpans(ca.spec.Feed.StatementTime, sv)) &&
 		canCheckpointSpans(sv, ca.lastSpanFlush)
 
@@ -981,7 +981,7 @@ type changeFrontier struct {
 
 	// frontier contains the current resolved timestamp high-water for the tracked
 	// span set.
-	frontier *schemaChangeFrontier
+	frontier *frontierResolvedSpanFrontier
 
 	// localState contains an in memory cache of progress updates.
 	// Used by core style changefeeds as well as regular changefeeds to make
@@ -1172,7 +1172,7 @@ func newChangeFrontierProcessor(
 	post *execinfrapb.PostProcessSpec,
 ) (execinfra.Processor, error) {
 	memMonitor := execinfra.NewMonitor(ctx, flowCtx.Mon, "changefntr-mem")
-	sf, err := makeSchemaChangeFrontier(hlc.Timestamp{}, spec.TrackedSpans...)
+	sf, err := newFrontierResolvedSpanFrontier(hlc.Timestamp{}, spec.TrackedSpans...)
 	if err != nil {
 		return nil, err
 	}
@@ -1233,14 +1233,14 @@ func newChangeFrontierProcessor(
 		return nil, err
 	}
 
-	sliMertics, err := flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
+	sliMetrics, err := flowCtx.Cfg.JobRegistry.MetricsStruct().Changefeed.(*Metrics).getSLIMetrics(cf.spec.Feed.Opts[changefeedbase.OptMetricsScope])
 	if err != nil {
 		return nil, err
 	}
 
 	if cf.encoder, err = getEncoder(
 		ctx, encodingOpts, AllTargets(spec.Feed), spec.Feed.Select != "",
-		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMertics,
+		makeExternalConnectionProvider(ctx, flowCtx.Cfg.DB), sliMetrics,
 	); err != nil {
 		return nil, err
 	}
@@ -1467,18 +1467,13 @@ func (cf *changeFrontier) close() {
 	}
 }
 
-// closeMetrics de-registers from the progress registry that powers
-// `changefeed.max_behind_nanos`. This method is idempotent.
 func (cf *changeFrontier) closeMetrics() {
-	// Delete this feed from the MaxBehindNanos metric so it's no longer
-	// considered by the gauge.
 	func() {
 		cf.metrics.mu.Lock()
 		defer cf.metrics.mu.Unlock()
 		if cf.metricsID > 0 {
 			cf.sliMetrics.RunningCount.Dec(1)
 		}
-		delete(cf.metrics.mu.resolved, cf.metricsID)
 		cf.metricsID = -1
 	}()
 
@@ -1615,7 +1610,7 @@ func (cf *changeFrontier) noteAggregatorProgress(d rowenc.EncDatum) error {
 }
 
 func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
-	frontierChanged, err := cf.frontier.ForwardResolvedSpan(resolved)
+	frontierChanged, err := cf.frontier.ForwardResolvedSpan(cf.Ctx(), resolved)
 	if err != nil {
 		return err
 	}
@@ -1639,15 +1634,6 @@ func (cf *changeFrontier) forwardFrontier(resolved jobspb.ResolvedSpan) error {
 		// checkpoint_progress metric which will return the lowest timestamp across
 		// all feeds in the scope.
 		cf.sliMetrics.setCheckpoint(cf.sliMetricsID, newResolved)
-
-		// This backs max_behind_nanos which is deprecated in favor of checkpoint_progress
-		func() {
-			cf.metrics.mu.Lock()
-			defer cf.metrics.mu.Unlock()
-			if cf.metricsID != -1 {
-				cf.metrics.mu.resolved[cf.metricsID] = newResolved
-			}
-		}()
 
 		return cf.maybeEmitResolved(newResolved)
 	}
@@ -1678,7 +1664,7 @@ func (cf *changeFrontier) maybeCheckpointJob(
 ) (bool, error) {
 	// When in a Backfill, the frontier remains unchanged at the backfill boundary
 	// as we receive spans from the scan request at the Backfill Timestamp
-	inBackfill := !frontierChanged && resolvedSpan.Timestamp.Equal(cf.frontier.BackfillTS())
+	inBackfill := !frontierChanged && cf.frontier.InBackfill(resolvedSpan)
 
 	// If we're not in a backfill, highwater progress and an empty checkpoint will
 	// be saved. This is throttled however we always persist progress to a schema
@@ -2010,15 +1996,15 @@ func makeSchemaChangeFrontier(
 
 // ForwardResolvedSpan advances the timestamp for a resolved span, taking care
 // of updating schema change boundary information.
-func (f *schemaChangeFrontier) ForwardResolvedSpan(r jobspb.ResolvedSpan) (bool, error) {
+func (f *schemaChangeFrontier) ForwardResolvedSpan(
+	ctx context.Context, r jobspb.ResolvedSpan,
+) (bool, error) {
 	if r.BoundaryType != jobspb.ResolvedSpan_NONE {
-		if !f.boundaryTime.IsEmpty() && r.Timestamp.Less(f.boundaryTime) {
-			// Boundary resolved events should be ingested from the schema feed
-			// serially, where the changefeed won't even observe a new schema change
-			// boundary until it has progressed past the current boundary
-			return false, errors.AssertionFailedf("received boundary timestamp %v < %v "+
-				"of type %v before reaching existing boundary of type %v",
-				r.Timestamp, f.boundaryTime, r.BoundaryType, f.boundaryType)
+		// Boundary resolved events should be ingested from the schema feed
+		// serially, where the changefeed won't even observe a new schema change
+		// boundary until it has progressed past the current boundary.
+		if err := f.assertBoundaryNotEarlier(ctx, r); err != nil {
+			return false, err
 		}
 		f.boundaryTime = r.Timestamp
 		f.boundaryType = r.BoundaryType
@@ -2077,16 +2063,15 @@ func (f *schemaChangeFrontier) getCheckpointSpans(
 	return getCheckpointSpans(f.Frontier(), f.Entries, maxBytes)
 }
 
-// BackfillTS returns the timestamp of the incoming spans for an ongoing
-// Backfill (either an Initial Scan backfill or a Schema Change backfill).
-// If no Backfill is occurring, an empty timestamp is returned.
-func (f *schemaChangeFrontier) BackfillTS() hlc.Timestamp {
+// InBackfill returns whether a resolved span is part of an ongoing backfill
+// (either an initial scan backfill or a schema change backfill).
+func (f *schemaChangeFrontier) InBackfill(r jobspb.ResolvedSpan) bool {
 	frontier := f.Frontier()
 
 	// The scan for the initial backfill results in spans sent at StatementTime,
 	// which is what initialHighWater is set to when performing an initial scan.
 	if frontier.IsEmpty() {
-		return f.initialHighWater
+		return r.Timestamp.Equal(f.initialHighWater)
 	}
 
 	// If the backfill is occurring after any initial scan (non-empty frontier),
@@ -2097,9 +2082,30 @@ func (f *schemaChangeFrontier) BackfillTS() hlc.Timestamp {
 	// is read from the job progress and is equal to the old BACKFILL boundary
 	restarted := frontier.Equal(f.initialHighWater)
 	if backfilling || restarted {
-		return frontier.Next()
+		return r.Timestamp.Equal(frontier.Next())
 	}
-	return hlc.Timestamp{}
+
+	return false
+}
+
+// assertBoundaryNotEarlier is a helper method provided to assert that a
+// resolved span does not have an earlier boundary than the existing one.
+func (f *schemaChangeFrontier) assertBoundaryNotEarlier(
+	ctx context.Context, r jobspb.ResolvedSpan,
+) error {
+	boundaryType := r.BoundaryType
+	if boundaryType == jobspb.ResolvedSpan_NONE {
+		return errors.AssertionFailedf("assertBoundaryNotEarlier should not be called for NONE boundary")
+	}
+	boundaryTS := r.Timestamp
+	if f.boundaryTime.After(boundaryTS) {
+		err := errors.AssertionFailedf("received resolved span for %s "+
+			"with %v boundary (%v), which is earlier than previously received %v boundary (%v)",
+			r.Span, r.BoundaryType, r.Timestamp, f.boundaryType, f.boundaryTime)
+		log.Errorf(ctx, "error while forwarding boundary resolved span: %v", err)
+		return err
+	}
+	return nil
 }
 
 // schemaChangeBoundaryReached returns true at the single moment when all spans
